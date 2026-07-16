@@ -8,16 +8,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -125,6 +126,7 @@ type cacheEntry struct {
 	Headers    map[string][]string `json:"headers"`
 	Body       []byte              `json:"-"`
 	Timestamp  time.Time           `json:"timestamp"`
+	Path       string              `json:"path"`
 }
 
 type CacheStore struct {
@@ -243,6 +245,7 @@ func (cs *CacheStore) Save(targetName, path string, statusCode int, headers http
 		Headers:    headers,
 		Body:       body,
 		Timestamp:  time.Now(),
+		Path:       path,
 	}
 
 	if err := os.WriteFile(cacheFile, body, 0644); err != nil {
@@ -356,6 +359,8 @@ func (cs *CacheStore) addToAccessOrder(key string) {
 		oldest := cs.accessOrder[0]
 		cs.accessOrder = cs.accessOrder[1:]
 		delete(cs.entries, oldest)
+		delete(cs.keyToTarget, oldest)
+		delete(cs.keyToPath, oldest)
 	}
 }
 
@@ -409,7 +414,7 @@ func (cs *CacheStore) loadAll() {
 			k := file.Name()[:len(file.Name())-len(".cache")]
 			cs.entries[k] = &entry
 			cs.keyToTarget[k] = targetName
-			cs.keyToPath[k] = ""
+			cs.keyToPath[k] = entry.Path
 			cs.addToAccessOrder(k)
 		}
 	}
@@ -424,15 +429,25 @@ func (cs *CacheStore) Cleanup() {
 	keysToRemove := []string{}
 
 	for k, entry := range cs.entries {
-		_ = k
 		if time.Since(entry.Timestamp) > cs.ttl {
 			keysToRemove = append(keysToRemove, k)
 		}
 	}
 
 	for _, k := range keysToRemove {
+		targetName := cs.keyToTarget[k]
+		path := cs.keyToPath[k]
+
 		delete(cs.entries, k)
 		delete(cs.keyToTarget, k)
+		delete(cs.keyToPath, k)
+
+		// Also remove the expired files from disk, not just the in-memory bookkeeping.
+		if targetName != "" && path != "" {
+			cacheFile := cs.cacheFilePath(targetName, path)
+			os.Remove(cacheFile)
+			os.Remove(cacheFile + ".meta")
+		}
 	}
 
 	if len(keysToRemove) > 0 {
@@ -603,7 +618,7 @@ func NewDefaultSSHExecutor(logger Logger) *DefaultSSHExecutor {
 
 func (s *DefaultSSHExecutor) ExecuteCommand(host, user, keyPath, command string) error {
 	// Read private key
-	key, err := ioutil.ReadFile(keyPath)
+	key, err := os.ReadFile(keyPath)
 	if err != nil {
 		return fmt.Errorf("unable to read private key: %w", err)
 	}
@@ -939,11 +954,48 @@ func (p *ProxyService) Start(ctx context.Context) error {
 		server.TLSConfig = tlsConfig
 
 		p.logger.Info("HTTPS server listening on %s with SSL certificates", p.config.Port)
-		//The files in these methods are ignored since there is already a certificate in the config.
-		return server.ListenAndServeTLS("", "")
+		return p.serveAndWaitForShutdown(ctx, server, func() error {
+			//The files in these methods are ignored since there is already a certificate in the config.
+			return server.ListenAndServeTLS("", "")
+		})
 	} else {
 		p.logger.Info("HTTP server listening on %s", p.config.Port)
-		return server.ListenAndServe()
+		return p.serveAndWaitForShutdown(ctx, server, server.ListenAndServe)
+	}
+}
+
+// serveAndWaitForShutdown runs the HTTP(S) server in the background and blocks until
+// either the server stops on its own (returning its error, if any) or ctx is
+// cancelled (e.g. via SIGINT/SIGTERM), in which case the server is shut down
+// gracefully with a bounded timeout.
+func (p *ProxyService) serveAndWaitForShutdown(ctx context.Context, server *http.Server, serve func() error) error {
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- serve()
+	}()
+
+	select {
+	case err := <-serverErr:
+		if err != nil && err != http.ErrServerClosed {
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		p.logger.Info("Shutdown signal received, stopping server gracefully...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			p.logger.Error("Error during server shutdown: %v", err)
+			return err
+		}
+
+		if p.cache != nil {
+			p.cache.Close()
+		}
+
+		p.logger.Info("Server stopped gracefully")
+		return nil
 	}
 }
 
@@ -1066,10 +1118,16 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, target *TargetState) err
 
 	target.mu.Lock()
 	target.LastActivity = time.Now()
-	target.IsWaking = false
 	target.mu.Unlock()
 
 	if err != nil {
+		// Only clear IsWaking here on failure - on success we keep it set until
+		// waitForWake reaches a terminal state (success/timeout/cancellation),
+		// so concurrent requests can actually join this wake instead of
+		// triggering their own WOL send + poll loop.
+		target.mu.Lock()
+		target.IsWaking = false
+		target.mu.Unlock()
 		return fmt.Errorf("failed to send WOL: %w", err)
 	}
 
@@ -1085,7 +1143,7 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 	defer healthCheckTicker.Stop()
 
 	// Create a separate ticker for sending WOL packets
-	// Send a packet once per second
+	// Send a packet every 500ms while waiting for the target to wake up
 	wolTicker := time.NewTicker(500 * time.Millisecond)
 	defer wolTicker.Stop()
 
@@ -1096,6 +1154,9 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 	for {
 		select {
 		case <-ctx.Done():
+			target.mu.Lock()
+			target.IsWaking = false
+			target.mu.Unlock()
 			return ctx.Err()
 		case <-timeout:
 			target.mu.Lock()
@@ -1137,10 +1198,6 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 				return nil
 			}
 		}
-
-		target.mu.Lock()
-		target.IsWaking = false
-		target.mu.Unlock()
 	}
 }
 
