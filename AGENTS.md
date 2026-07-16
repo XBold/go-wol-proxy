@@ -39,3 +39,12 @@ docker pull ghcr.io/<repository>:latest
 docker pull ghcr.io/<repository>:v1.0.0
 ```
 
+## General Rules
+
+### No Artifacts
+**IMPORTANT:** Never leave build artifacts, temporary files, or generated binaries in the repository.
+- If you run a build command, clean up the output immediately after verification
+- Never commit `.exe`, `.dll`, `.so`, or other binary artifacts
+- Never leave temporary files, caches, or IDE directories behind
+- If you need to verify a build, remove the artifacts before finishing the task
+

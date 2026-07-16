@@ -3,8 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
@@ -12,6 +15,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -43,15 +47,16 @@ type Logger interface {
 
 // Config structs
 type Config struct {
-	Port                  string   `toml:"port"`
-	Timeout               string   `toml:"timeout"`
-	ResponseHeaderTimeout string   `toml:"response_header_timeout"`
-	PollInterval          string   `toml:"poll_interval"`
-	HealthCheckInterval   string   `toml:"health_check_interval"`
-	HealthCacheDuration   string   `toml:"health_cache_duration"`
-	SSLCertificate        string   `toml:"ssl_certificate"`
-	SSLCertificateKey     string   `toml:"ssl_certificate_key"`
-	Targets               []Target `toml:"targets"`
+	Port                  string          `toml:"port"`
+	Timeout               string          `toml:"timeout"`
+	ResponseHeaderTimeout string          `toml:"response_header_timeout"`
+	PollInterval          string          `toml:"poll_interval"`
+	HealthCheckInterval   string          `toml:"health_check_interval"`
+	HealthCacheDuration   string          `toml:"health_cache_duration"`
+	SSLCertificate        string          `toml:"ssl_certificate"`
+	SSLCertificateKey     string          `toml:"ssl_certificate_key"`
+	Targets               []Target        `toml:"targets"`
+	CacheConfig           CacheConfig     `toml:"cache"`
 }
 
 type Target struct {
@@ -72,6 +77,20 @@ type Target struct {
 	InactivityThreshold  string `toml:"inactivity_threshold"`
 }
 
+type CacheConfig struct {
+	Enabled                        bool   `toml:"enabled"`
+	RootPath                       string `toml:"root_path"`
+	TTL                            string `toml:"ttl"`
+	MaxResponseSizeBytes           int64  `toml:"max_response_size_bytes"`
+	WarmInterval                   string `toml:"warm_interval"`
+	Targets                        []CacheTargetConfig `toml:"targets"`
+}
+
+type CacheTargetConfig struct {
+	Target string   `toml:"target"`
+	Paths  []string `toml:"paths"`
+}
+
 type ProxyConfig struct {
 	Port                  string
 	Timeout               time.Duration
@@ -80,10 +99,16 @@ type ProxyConfig struct {
 	HealthCheckInterval   time.Duration
 	HealthCacheDuration   time.Duration
 	Targets               map[string]*TargetState
-	HostnameMap           map[string]string        // hostname -> target name
-	InactivityThresholds  map[string]time.Duration // target name -> inactivity threshold
+	HostnameMap           map[string]string              // hostname -> target name
+	InactivityThresholds  map[string]time.Duration       // target name -> inactivity threshold
 	SSLCertificate        string
 	SSLCertificateKey     string
+	CacheEnabled          bool
+	CacheRootPath         string
+	CacheTTL              time.Duration
+	CacheMaxResponseSize  int64
+	CacheWarmInterval     time.Duration
+	CachePaths            map[string][]string // target name -> list of cached paths
 }
 
 type TargetState struct {
@@ -93,6 +118,330 @@ type TargetState struct {
 	IsWaking     bool
 	LastActivity time.Time
 	mu           sync.RWMutex
+}
+
+type cacheEntry struct {
+	StatusCode int               `json:"status_code"`
+	Headers    map[string][]string `json:"headers"`
+	Body       []byte              `json:"-"`
+	Timestamp  time.Time           `json:"timestamp"`
+}
+
+type CacheStore struct {
+	rootPath     string
+	ttl          time.Duration
+	maxSize      int64
+	logger       Logger
+	entriesMu    sync.RWMutex
+	entries      map[string]*cacheEntry
+	targetPaths  map[string][]string // target name -> list of patterns
+	keyToTarget  map[string]string   // cache key -> target name
+	keyToPath    map[string]string   // cache key -> path
+	accessOrder  []string
+	maxEntries   int
+}
+
+func NewCacheStore(rootPath string, ttl time.Duration, maxSize int64, targetPaths map[string][]string, logger Logger) *CacheStore {
+	cs := &CacheStore{
+		rootPath:    rootPath,
+		ttl:         ttl,
+		maxSize:     maxSize,
+		logger:      logger,
+		entries:     make(map[string]*cacheEntry),
+		targetPaths: targetPaths,
+		keyToTarget: make(map[string]string),
+		keyToPath:   make(map[string]string),
+		accessOrder: []string{},
+		maxEntries:  1000,
+	}
+
+	if err := os.MkdirAll(rootPath, 0755); err != nil {
+		logger.Error("Failed to create cache directory %s: %v", rootPath, err)
+	}
+
+	cs.loadAll()
+
+	return cs
+}
+
+func (cs *CacheStore) key(targetName, path string) string {
+	hash := sha256.Sum256([]byte(targetName + path))
+	return fmt.Sprintf("%x", hash[:16])
+}
+
+func (cs *CacheStore) cacheFilePath(targetName, path string) string {
+	return filepath.Join(cs.rootPath, targetName, cs.key(targetName, path)+".cache")
+}
+
+func (cs *CacheStore) load(targetName, path string) (*cacheEntry, bool) {
+	path = filepath.Clean(path)
+	if path == "." || path == "" {
+		return nil, false
+	}
+
+	cacheFile := cs.cacheFilePath(targetName, path)
+
+	data, err := os.ReadFile(cacheFile)
+	if err != nil {
+		return nil, false
+	}
+
+	var entry cacheEntry
+	metaFile := cacheFile + ".meta"
+	metaData, err := os.ReadFile(metaFile)
+	if err != nil {
+		return nil, false
+	}
+
+	if err := json.Unmarshal(metaData, &entry); err != nil {
+		return nil, false
+	}
+
+	entry.Body = data
+
+	if time.Since(entry.Timestamp) > cs.ttl {
+		os.Remove(cacheFile)
+		os.Remove(metaFile)
+		return nil, false
+	}
+
+	cs.entriesMu.Lock()
+	k := cs.key(targetName, path)
+	if _, exists := cs.entries[k]; !exists {
+		cs.entries[k] = &entry
+		cs.keyToTarget[k] = targetName
+		cs.keyToPath[k] = path
+		cs.addToAccessOrder(k)
+	}
+	cs.entriesMu.Unlock()
+
+	return &entry, true
+}
+
+func (cs *CacheStore) Save(targetName, path string, statusCode int, headers http.Header, body []byte) {
+	path = filepath.Clean(path)
+	if path == "." || path == "" {
+		return
+	}
+
+	if int64(len(body)) > cs.maxSize {
+		cs.logger.Info("Response too large for cache (%d bytes) for %s %s", len(body), targetName, path)
+		return
+	}
+
+	cacheDir := filepath.Join(cs.rootPath, targetName)
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		cs.logger.Error("Failed to create cache directory %s: %v", cacheDir, err)
+		return
+	}
+
+	cacheFile := cs.cacheFilePath(targetName, path)
+	metaFile := cacheFile + ".meta"
+
+	meta := &cacheEntry{
+		StatusCode: statusCode,
+		Headers:    headers,
+		Body:       body,
+		Timestamp:  time.Now(),
+	}
+
+	if err := os.WriteFile(cacheFile, body, 0644); err != nil {
+		cs.logger.Error("Failed to write cache file %s: %v", cacheFile, err)
+		return
+	}
+
+	metaData, err := json.Marshal(meta)
+	if err != nil {
+		cs.logger.Error("Failed to marshal cache metadata: %v", err)
+		return
+	}
+
+	if err := os.WriteFile(metaFile, metaData, 0644); err != nil {
+		cs.logger.Error("Failed to write cache metadata %s: %v", metaFile, err)
+		return
+	}
+
+	cs.entriesMu.Lock()
+	k := cs.key(targetName, path)
+	cs.entries[k] = meta
+	cs.keyToTarget[k] = targetName
+	cs.keyToPath[k] = path
+	cs.addToAccessOrder(k)
+	cs.entriesMu.Unlock()
+
+	cs.logger.Info("Cached response for %s %s", targetName, path)
+}
+
+func (cs *CacheStore) Get(targetName, path string) (*http.Response, bool) {
+	entry, ok := cs.load(targetName, path)
+	if !ok {
+		return nil, false
+	}
+
+	resp := &http.Response{
+		StatusCode: entry.StatusCode,
+		Status:     http.StatusText(entry.StatusCode),
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     entry.Headers,
+		Body:       io.NopCloser(bytes.NewReader(entry.Body)),
+	}
+
+	return resp, true
+}
+
+func (cs *CacheStore) GetCachedPathsForTarget(targetName string) []string {
+	cs.entriesMu.RLock()
+	defer cs.entriesMu.RUnlock()
+
+	targetPaths, exists := cs.targetPaths[targetName]
+	if !exists || len(targetPaths) == 0 {
+		return nil
+	}
+
+	var result []string
+	for _, pattern := range targetPaths {
+		if strings.HasSuffix(pattern, "/*") {
+			prefix := strings.TrimSuffix(pattern, "/*")
+			for key := range cs.keyToPath {
+				if cs.keyToTarget[key] == targetName {
+					if p := cs.keyToPath[key]; p != "" && strings.HasPrefix(p, prefix) {
+						result = append(result, p)
+					}
+				}
+			}
+		} else {
+			result = append(result, pattern)
+		}
+	}
+
+	return result
+}
+
+func (cs *CacheStore) InvalidateTarget(targetName string) {
+	cs.entriesMu.Lock()
+	defer cs.entriesMu.Unlock()
+
+	keysToRemove := []string{}
+	for k, t := range cs.keyToTarget {
+		if t == targetName {
+			keysToRemove = append(keysToRemove, k)
+		}
+	}
+
+	for _, k := range keysToRemove {
+		delete(cs.entries, k)
+		delete(cs.keyToTarget, k)
+		delete(cs.keyToPath, k)
+	}
+
+	cacheDir := filepath.Join(cs.rootPath, targetName)
+	if err := os.RemoveAll(cacheDir); err != nil {
+		cs.logger.Error("Failed to remove cache directory %s: %v", cacheDir, err)
+	}
+
+	cs.logger.Info("Cache invalidated for target: %s (removed %d entries)", targetName, len(keysToRemove))
+}
+
+func (cs *CacheStore) addToAccessOrder(key string) {
+	for i, k := range cs.accessOrder {
+		if k == key {
+			cs.accessOrder = append(cs.accessOrder[:i], cs.accessOrder[i+1:]...)
+			break
+		}
+	}
+	cs.accessOrder = append(cs.accessOrder, key)
+	for len(cs.accessOrder) > cs.maxEntries {
+		oldest := cs.accessOrder[0]
+		cs.accessOrder = cs.accessOrder[1:]
+		delete(cs.entries, oldest)
+	}
+}
+
+func (cs *CacheStore) loadAll() {
+	targets := make(map[string]bool)
+	for targetName := range cs.targetPaths {
+		targets[targetName] = true
+	}
+
+	for targetName := range targets {
+		dir := filepath.Join(cs.rootPath, targetName)
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+
+		for _, file := range files {
+			if file.IsDir() || !strings.HasSuffix(file.Name(), ".cache") {
+				continue
+			}
+
+			if strings.HasSuffix(file.Name(), ".meta.cache") {
+				continue
+			}
+
+			cacheFile := filepath.Join(dir, file.Name())
+			metaFile := cacheFile + ".meta"
+
+			metaData, err := os.ReadFile(metaFile)
+			if err != nil {
+				continue
+			}
+
+			var entry cacheEntry
+			if err := json.Unmarshal(metaData, &entry); err != nil {
+				continue
+			}
+
+			if time.Since(entry.Timestamp) > cs.ttl {
+				os.Remove(cacheFile)
+				os.Remove(metaFile)
+				continue
+			}
+
+			body, err := os.ReadFile(cacheFile)
+			if err != nil {
+				continue
+			}
+
+			entry.Body = body
+			k := file.Name()[:len(file.Name())-len(".cache")]
+			cs.entries[k] = &entry
+			cs.keyToTarget[k] = targetName
+			cs.keyToPath[k] = ""
+			cs.addToAccessOrder(k)
+		}
+	}
+
+	cs.logger.Info("Loaded %d cache entries", len(cs.entries))
+}
+
+func (cs *CacheStore) Cleanup() {
+	cs.entriesMu.Lock()
+	defer cs.entriesMu.Unlock()
+
+	keysToRemove := []string{}
+
+	for k, entry := range cs.entries {
+		_ = k
+		if time.Since(entry.Timestamp) > cs.ttl {
+			keysToRemove = append(keysToRemove, k)
+		}
+	}
+
+	for _, k := range keysToRemove {
+		delete(cs.entries, k)
+		delete(cs.keyToTarget, k)
+	}
+
+	if len(keysToRemove) > 0 {
+		cs.logger.Info("Cleaned up %d expired cache entries", len(keysToRemove))
+	}
+}
+
+func (cs *CacheStore) Close() {
+	cs.Cleanup()
 }
 
 // HTTP Health Checker implementation
@@ -354,6 +703,7 @@ type ProxyService struct {
 	wolSender     WOLSender
 	sshExecutor   SSHExecutor
 	logger        Logger
+	cache         *CacheStore
 }
 
 func NewProxyService(
@@ -362,6 +712,7 @@ func NewProxyService(
 	wolSender WOLSender,
 	sshExecutor SSHExecutor,
 	logger Logger,
+	cache *CacheStore,
 ) *ProxyService {
 	return &ProxyService{
 		config:        config,
@@ -369,6 +720,7 @@ func NewProxyService(
 		wolSender:     wolSender,
 		sshExecutor:   sshExecutor,
 		logger:        logger,
+		cache:         cache,
 	}
 }
 
@@ -481,6 +833,46 @@ func (p *ProxyService) checkInactiveTargets() {
 	}
 }
 
+func (p *ProxyService) startCacheCleanup(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.cache.Cleanup()
+		}
+	}
+}
+
+func (p *ProxyService) startCacheWarming(ctx context.Context) {
+	ticker := time.NewTicker(p.config.CacheWarmInterval)
+	defer ticker.Stop()
+
+	for _, targetState := range p.config.Targets {
+		p.warmCache(targetState.Target.Name)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, targetState := range p.config.Targets {
+				targetState.mu.RLock()
+				isHealthy := targetState.IsHealthy
+				targetState.mu.RUnlock()
+
+				if isHealthy {
+					p.warmCache(targetState.Target.Name)
+				}
+			}
+		}
+	}
+}
+
 func isSecureServer(config *ProxyConfig) bool {
 	return config.SSLCertificate != "" && config.SSLCertificateKey != ""
 }
@@ -501,6 +893,15 @@ func (p *ProxyService) Start(ctx context.Context) error {
 
 	// Start background inactivity monitor
 	go p.startInactivityMonitor(ctx)
+
+	// Start cache background tasks if cache is enabled
+	if p.cache != nil && p.config.CacheEnabled {
+		p.logger.Info("Cache enabled, root path: %s, TTL: %v, warm interval: %v",
+			p.config.CacheRootPath, p.config.CacheTTL, p.config.CacheWarmInterval)
+
+		go p.startCacheCleanup(ctx)
+		go p.startCacheWarming(ctx)
+	}
 
 	p.logger.Info("Initial health checks completed, starting HTTP server")
 
@@ -571,6 +972,25 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 		p.logger.Info("Target %s is healthy, proxying immediately", targetName)
 		p.proxyRequest(w, r, targetState.Target)
 		return
+	}
+
+	// Check static cache before triggering WOL
+	if p.cache != nil && p.config.CacheEnabled {
+		if r.Method == "GET" {
+			if resp, ok := p.cache.Get(targetName, r.URL.Path); ok {
+				p.logger.Info("Serving cached response for %s %s (target %s is down)",
+					r.Method, r.URL.Path, targetName)
+				for k, v := range resp.Header {
+					for _, header := range v {
+						w.Header().Add(k, header)
+					}
+				}
+				w.WriteHeader(resp.StatusCode)
+				io.Copy(w, resp.Body)
+				resp.Body.Close()
+				return
+			}
+		}
 	}
 
 	// Need to wake up the server
@@ -708,6 +1128,12 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 				wakeDuration := time.Since(wakeStartTime)
 				p.logger.Info("Target %s (%s) woke up after %v",
 					target.Target.Name, target.Target.Hostname, wakeDuration)
+
+				if p.cache != nil && p.config.CacheEnabled {
+					p.cache.InvalidateTarget(target.Target.Name)
+					go p.warmCache(target.Target.Name)
+				}
+
 				return nil
 			}
 		}
@@ -716,6 +1142,107 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) err
 		target.IsWaking = false
 		target.mu.Unlock()
 	}
+}
+
+type catchingBody struct {
+	io.Reader
+	original io.ReadCloser
+	onDone   func()
+	closed   bool
+}
+
+func (cb *catchingBody) Close() error {
+	if cb.closed {
+		return nil
+	}
+	cb.closed = true
+
+	if cb.onDone != nil {
+		cb.onDone()
+	}
+	if cb.original != nil {
+		return cb.original.Close()
+	}
+	return nil
+}
+
+func (p *ProxyService) warmCache(targetName string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	p.logger.Info("Starting cache warmup for target: %s", targetName)
+
+	cachedPaths := p.cache.GetCachedPathsForTarget(targetName)
+	if len(cachedPaths) == 0 {
+		p.logger.Info("No cached paths to warm for target: %s", targetName)
+		return
+	}
+
+	targetState, exists := p.config.Targets[targetName]
+	if !exists {
+		return
+	}
+
+	target := targetState.Target
+	targetURL, err := url.Parse(target.Destination)
+	if err != nil {
+		return
+	}
+
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+				DualStack: true,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          10,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			DisableCompression:    true,
+		},
+	}
+
+	for _, path := range cachedPaths {
+		select {
+		case <-ctx.Done():
+			p.logger.Info("Cache warmup cancelled for target: %s", targetName)
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+
+		reqURL := *targetURL
+		reqURL.Path = path
+
+		req, err := http.NewRequestWithContext(ctx, "GET", reqURL.String(), nil)
+		if err != nil {
+			p.logger.Info("Failed to create request for %s %s: %v", targetName, path, err)
+			continue
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			p.logger.Info("Failed to warm cache for %s %s: %v", targetName, path, err)
+			continue
+		}
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			body, err := io.ReadAll(io.LimitReader(resp.Body, p.config.CacheMaxResponseSize))
+			resp.Body.Close()
+
+			if err == nil {
+				p.cache.Save(targetName, path, resp.StatusCode, resp.Header, body)
+			}
+		} else {
+			resp.Body.Close()
+		}
+	}
+
+	p.logger.Info("Cache warmup completed for target: %s", targetName)
 }
 
 func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, target *Target) {
@@ -785,6 +1312,41 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, targ
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		p.logger.Info("Response from %s: status=%d, content-length=%d",
 			target.Name, resp.StatusCode, resp.ContentLength)
+
+		if p.cache != nil && p.config.CacheEnabled && r.Method == "GET" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			cachePaths, exists := p.config.CachePaths[target.Name]
+			if exists {
+				var shouldCache bool
+				for _, pattern := range cachePaths {
+					if strings.HasSuffix(pattern, "/*") {
+						prefix := strings.TrimSuffix(pattern, "/*")
+						if strings.HasPrefix(r.URL.Path, prefix) {
+							shouldCache = true
+							break
+						}
+					} else if r.URL.Path == pattern {
+						shouldCache = true
+						break
+					}
+				}
+
+				if shouldCache {
+					buf := &bytes.Buffer{}
+					tee := io.TeeReader(resp.Body, buf)
+					resp.Body = &catchingBody{
+						Reader:   tee,
+						original: resp.Body,
+						onDone: func() {
+							body := buf.Bytes()
+							if int64(len(body)) <= p.config.CacheMaxResponseSize {
+								p.cache.Save(target.Name, r.URL.Path, resp.StatusCode, resp.Header, body)
+							}
+						},
+					}
+				}
+			}
+		}
+
 		return nil
 	}
 
@@ -837,6 +1399,48 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 	healthCacheDuration, err := time.ParseDuration(config.HealthCacheDuration)
 	if err != nil {
 		return nil, fmt.Errorf("invalid health_cache_duration: %w", err)
+	}
+
+	var cacheEnabled bool
+	var cacheRootPath string
+	var cacheTTL time.Duration
+	var cacheMaxResponseSize int64
+	var cacheWarmInterval time.Duration
+	cachePaths := make(map[string][]string)
+
+	if config.CacheConfig.Enabled {
+		cacheEnabled = true
+		cacheRootPath = config.CacheConfig.RootPath
+		if cacheRootPath == "" {
+			cacheRootPath = "./cache"
+		}
+
+		cacheTTL = 24 * time.Hour
+		if config.CacheConfig.TTL != "" {
+			cacheTTL, err = time.ParseDuration(config.CacheConfig.TTL)
+			if err != nil {
+				return nil, fmt.Errorf("invalid cache ttl: %w", err)
+			}
+		}
+
+		cacheMaxResponseSize = 10 * 1024 * 1024
+		if config.CacheConfig.MaxResponseSizeBytes > 0 {
+			cacheMaxResponseSize = config.CacheConfig.MaxResponseSizeBytes
+		}
+
+		cacheWarmInterval = 30 * time.Minute
+		if config.CacheConfig.WarmInterval != "" {
+			cacheWarmInterval, err = time.ParseDuration(config.CacheConfig.WarmInterval)
+			if err != nil {
+				return nil, fmt.Errorf("invalid cache warm_interval: %w", err)
+			}
+		}
+
+		for _, ct := range config.CacheConfig.Targets {
+			if ct.Target != "" && len(ct.Paths) > 0 {
+				cachePaths[ct.Target] = ct.Paths
+			}
+		}
 	}
 
 	targets := make(map[string]*TargetState)
@@ -894,6 +1498,12 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		Targets:               targets,
 		HostnameMap:           hostnameMap,
 		InactivityThresholds:  inactivityThresholds,
+		CacheEnabled:          cacheEnabled,
+		CacheRootPath:         cacheRootPath,
+		CacheTTL:              cacheTTL,
+		CacheMaxResponseSize:  cacheMaxResponseSize,
+		CacheWarmInterval:     cacheWarmInterval,
+		CachePaths:            cachePaths,
 	}, nil
 }
 
@@ -928,8 +1538,13 @@ func main() {
 	wolSender := NewUDPWOLSender(logger)
 	sshExecutor := NewDefaultSSHExecutor(logger)
 
+	var cache *CacheStore
+	if config.CacheEnabled {
+		cache = NewCacheStore(config.CacheRootPath, config.CacheTTL, config.CacheMaxResponseSize, config.CachePaths, logger)
+	}
+
 	// Create proxy service
-	proxy := NewProxyService(config, healthChecker, wolSender, sshExecutor, logger)
+	proxy := NewProxyService(config, healthChecker, wolSender, sshExecutor, logger, cache)
 
 	// Start the service
 	ctx := context.Background()
