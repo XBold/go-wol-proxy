@@ -57,6 +57,7 @@ inactivity_threshold = "1h"                   # Shut down after 1 hour of inacti
 ssh_host = "service.local:22"                 # SSH host:port for shutdown
 ssh_user = "wol-proxy"                        # SSH username for shutdown
 ssh_key_path = "/app/private_key"             # Path to SSH private key
+ssh_known_hosts = "/app/known_hosts"          # Path to known_hosts file (optional; omits host key verification if unset)
 shutdown_command = "sudo systemctl suspend"   # Command to execute for shutdown
 # ^ take care - wake from suspend / shutdown can be flaky on some systems.
 # if your machine doesnt wake from your chosen "sleep" mode, try another.
@@ -119,8 +120,10 @@ services:
     restart: unless-stopped
     volumes:
       - ./config.toml:/app/config.toml
-      # Optional: SSH private key for graceful shutdown
+      # Optional: SSH private key and known_hosts for graceful shutdown
       - ./private_key:/app/private_key
+      # Optional: known_hosts file for SSH host key verification
+      # - ./known_hosts:/app/known_hosts
 ```
 
 Run the container with Docker Compose:
@@ -136,6 +139,7 @@ docker-compose up -d
 
 ### SSH-based Shutdown
 - Use `ssh_host`, `ssh_user`, `ssh_key_path`, and `shutdown_command`.
+- Optionally set `ssh_known_hosts` to enable host key verification (uses `InsecureIgnoreHostKey()` if unset).
 - The proxy executes the command over SSH when the target is inactive.
 
 ### HTTP-based Shutdown
