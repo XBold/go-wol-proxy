@@ -91,6 +91,7 @@ type Logger interface {
 type Config struct {
 	Port                  string      `toml:"port"`
 	Timeout               string      `toml:"timeout"`
+	StartupTime           string      `toml:"startup_time"`
 	ResponseHeaderTimeout string      `toml:"response_header_timeout"`
 	PollInterval          string      `toml:"poll_interval"`
 	HealthCheckInterval   string      `toml:"health_check_interval"`
@@ -138,6 +139,7 @@ type CacheTargetConfig struct {
 type ProxyConfig struct {
 	Port                  string
 	Timeout               time.Duration
+	StartupTime           time.Duration
 	ResponseHeaderTimeout time.Duration
 	PollInterval          time.Duration
 	HealthCheckInterval   time.Duration
@@ -553,19 +555,19 @@ func (h *HTTPHealthChecker) CloseIdleConnections() {
 func (h *HTTPHealthChecker) Check(ctx context.Context, endpoint string, source string) bool {
 	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
-		h.logger.Info("Health check (%s) failed for %s: %v", source, endpoint, err)
+		h.logger.Debug("Health check (%s) failed for %s: %v", source, endpoint, err)
 		return false
 	}
 
 	resp, err := h.client.Do(req)
 	if err != nil {
-		h.logger.Info("Health check (%s) failed for %s: %v", source, endpoint, err)
+		h.logger.Debug("Health check (%s) failed for %s: %v", source, endpoint, err)
 		return false
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		h.logger.Info("Health check (%s) failed for %s: status %d", source, endpoint, resp.StatusCode)
+		h.logger.Debug("Health check (%s) failed for %s: status %d", source, endpoint, resp.StatusCode)
 		return false
 	}
 
@@ -618,7 +620,7 @@ func (h *HTTPHealthChecker) performCheck(name string, target *TargetState) {
 	isWaking := target.IsWaking
 	target.mu.RUnlock()
 	if isWaking {
-		h.logger.Info("Background health check for %s (%s) running while wake is in progress",
+		h.logger.Debug("Background health check for %s (%s) running while wake is in progress",
 			name, target.Target.Hostname)
 	}
 
@@ -1160,8 +1162,8 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.logger.Info("Incoming request for hostname: %s -> target: %s, path: %s",
-		r.Host, targetName, r.URL.Path)
+	p.logger.Info("Incoming request for hostname: %s -> target: %s, path: %s (client: %s)",
+		r.Host, targetName, r.URL.Path, r.RemoteAddr)
 
 	targetState, exists := p.config.Targets[targetName]
 	if !exists {
@@ -1265,18 +1267,15 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, target *TargetState) (in
 	target.IsWaking = true
 	target.mu.Unlock()
 
-	err := p.wolSender.SendWOL(
-		target.Target.MacAddress,
-		target.Target.BroadcastIP,
-		target.Target.WolPort,
-	)
-
 	target.mu.Lock()
 	target.LastActivity = time.Now()
 	target.mu.Unlock()
 
-	if err != nil {
-		// Only clear IsWaking here on failure
+	if err := p.wolSender.SendWOL(
+		target.Target.MacAddress,
+		target.Target.BroadcastIP,
+		target.Target.WolPort,
+	); err != nil {
 		target.mu.Lock()
 		target.IsWaking = false
 		target.mu.Unlock()
@@ -1291,23 +1290,33 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, target *TargetState) (in
 
 func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState, wakeGen int) error {
 	timeout := time.After(p.config.Timeout)
-	healthCheckTicker := time.NewTicker(p.config.PollInterval)
-	defer healthCheckTicker.Stop()
-
-	// Create a separate ticker for sending WOL packets
-	// Send a packet every 500ms while waiting for the target to wake up
-	wolTicker := time.NewTicker(500 * time.Millisecond)
-	defer wolTicker.Stop()
-
 	wakeStartTime := time.Now()
-	p.logger.Info("Waiting for %s (%s) to wake (poll interval %v, timeout %v, gen=%d)",
-		target.Target.Name, target.Target.Hostname, p.config.PollInterval, p.config.Timeout, wakeGen)
+	waitDuration := p.config.StartupTime
+	burstCount := 3
+
+	sendWOLBurst := func() {
+		for i := 0; i < burstCount; i++ {
+			if err := p.wolSender.SendWOL(
+				target.Target.MacAddress,
+				target.Target.BroadcastIP,
+				target.Target.WolPort,
+			); err != nil {
+				p.logger.Error("Failed to send WOL packet during burst: %v", err)
+			} else if i > 0 {
+				p.logger.Info("Sent WOL burst packet %d/%d to %s (%s)",
+					i+1, burstCount, target.Target.Name, target.Target.Hostname)
+			}
+			if i < burstCount-1 {
+				time.Sleep(500 * time.Millisecond)
+			}
+		}
+	}
+
+	sendWOLBurst()
 
 	for {
 		select {
 		case <-ctx.Done():
-			// Only the coordinator (gen == wakeGen) may clear IsWaking on context cancel.
-			// Joiners must not interfere with the active wake.
 			target.mu.Lock()
 			if target.wakeGen == wakeGen {
 				target.IsWaking = false
@@ -1322,26 +1331,11 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState, wak
 			target.mu.Unlock()
 			return fmt.Errorf("timeout waiting for %s to wake up after %v",
 				target.Target.Name, p.config.Timeout)
-		case <-wolTicker.C:
-			// Send additional WOL packets while waiting
-			err := p.wolSender.SendWOL(
-				target.Target.MacAddress,
-				target.Target.BroadcastIP,
-				target.Target.WolPort,
-			)
-			if err != nil {
-				p.logger.Error("Failed to send additional WOL packet: %v", err)
-				// Continue waiting even if a packet fails to send
-			} else {
-				p.logger.Info("Sent additional WOL packet to %s (%s)",
-					target.Target.Name, target.Target.Hostname)
-			}
-		case <-healthCheckTicker.C:
+		default:
 			target.mu.RLock()
 			currentGen := target.wakeGen
 			target.mu.RUnlock()
 
-			// If a new wake started while we were waiting, stop polling
 			if currentGen != wakeGen {
 				p.logger.Info("Wake generation changed (old=%d, new=%d), abandoning wait for %s",
 					wakeGen, currentGen, target.Target.Name)
@@ -1361,10 +1355,69 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState, wak
 
 				if p.cache != nil && p.config.CacheEnabled {
 					p.cache.InvalidateTarget(target.Target.Name)
-					go p.warmCache(target.Target.Name)
 				}
 
 				return nil
+			}
+
+			select {
+			case <-ctx.Done():
+				target.mu.Lock()
+				if target.wakeGen == wakeGen {
+					target.IsWaking = false
+				}
+				target.mu.Unlock()
+				return ctx.Err()
+			case <-timeout:
+				target.mu.Lock()
+				if target.wakeGen == wakeGen {
+					target.IsWaking = false
+				}
+				target.mu.Unlock()
+				return fmt.Errorf("timeout waiting for %s to wake up after %v",
+					target.Target.Name, p.config.Timeout)
+			case <-time.After(waitDuration):
+				if p.healthChecker.Check(ctx, target.Target.HealthEndpoint, "wake") {
+					target.mu.Lock()
+					target.IsHealthy = true
+					target.LastCheck = time.Now()
+					target.IsWaking = false
+					target.mu.Unlock()
+
+					wakeDuration := time.Since(wakeStartTime)
+					p.logger.Info("Target %s (%s) woke up after %v (gen=%d)",
+						target.Target.Name, target.Target.Hostname, wakeDuration, wakeGen)
+
+					if p.cache != nil && p.config.CacheEnabled {
+						p.cache.InvalidateTarget(target.Target.Name)
+					}
+
+					return nil
+				}
+
+				select {
+				case <-ctx.Done():
+					target.mu.Lock()
+					if target.wakeGen == wakeGen {
+						target.IsWaking = false
+					}
+					target.mu.Unlock()
+					return ctx.Err()
+				case <-timeout:
+					target.mu.Lock()
+					if target.wakeGen == wakeGen {
+						target.IsWaking = false
+					}
+					target.mu.Unlock()
+					return fmt.Errorf("timeout waiting for %s to wake up after %v",
+						target.Target.Name, p.config.Timeout)
+				default:
+					sendWOLBurst()
+					waitDuration = waitDuration / 2
+					if waitDuration < 500*time.Millisecond {
+						waitDuration = 500 * time.Millisecond
+					}
+				}
 			}
 		}
 	}
@@ -1583,6 +1636,17 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		return nil, fmt.Errorf("invalid timeout: %w", err)
 	}
 
+	startupTime := 30 * time.Second
+	if config.StartupTime != "" {
+		startupTime, err = time.ParseDuration(config.StartupTime)
+		if err != nil {
+			return nil, fmt.Errorf("invalid startup_time: %w", err)
+		}
+	}
+	if startupTime >= timeout {
+		return nil, fmt.Errorf("startup_time (%v) must be less than timeout (%v)", startupTime, timeout)
+	}
+
 	if config.ResponseHeaderTimeout == "" {
 		config.ResponseHeaderTimeout = "1m"
 	}
@@ -1716,6 +1780,7 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		SSLCertificate:        config.SSLCertificate,
 		SSLCertificateKey:     config.SSLCertificateKey,
 		Timeout:               timeout,
+		StartupTime:           startupTime,
 		ResponseHeaderTimeout: responseHeaderTimeout,
 		PollInterval:          pollInterval,
 		HealthCheckInterval:   healthCheckInterval,
