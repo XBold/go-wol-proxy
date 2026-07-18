@@ -41,6 +41,12 @@ docker pull ghcr.io/<repository>:v1.0.0
 
 ## General Rules
 
+### No Pushing
+**IMPORTANT:** Never push changes to the remote repository without explicit permission.
+- Always commit first and wait for user confirmation before pushing
+- Only push when the user explicitly says "push" or "push to remote"
+- Never auto-push after commits, merges, or branch operations
+
 ### No Artifacts
 **IMPORTANT:** Never leave build artifacts, temporary files, or generated binaries in the repository.
 - If you run a build command, clean up the output immediately after verification
