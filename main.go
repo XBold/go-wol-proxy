@@ -25,6 +25,46 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+// Log levels
+type LogLevel int
+
+const (
+	LogLevelDebug LogLevel = iota
+	LogLevelInfo
+	LogLevelWarn
+	LogLevelError
+)
+
+func ParseLogLevel(s string) LogLevel {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "debug", "dbg":
+		return LogLevelDebug
+	case "warn", "warning":
+		return LogLevelWarn
+	case "error", "err":
+		return LogLevelError
+	case "info", "inf", "":
+		return LogLevelInfo
+	default:
+		return LogLevelInfo
+	}
+}
+
+func (l LogLevel) String() string {
+	switch l {
+	case LogLevelDebug:
+		return "debug"
+	case LogLevelInfo:
+		return "info"
+	case LogLevelWarn:
+		return "warn"
+	case LogLevelError:
+		return "error"
+	default:
+		return "info"
+	}
+}
+
 // Interfaces for dependency injection
 type HealthChecker interface {
 	Check(ctx context.Context, endpoint string, source string) bool
@@ -44,6 +84,7 @@ type SSHExecutor interface {
 type Logger interface {
 	Info(msg string, args ...interface{})
 	Error(msg string, args ...interface{})
+	Debug(msg string, args ...interface{})
 }
 
 // Config structs
@@ -56,6 +97,7 @@ type Config struct {
 	HealthCacheDuration   string      `toml:"health_cache_duration"`
 	SSLCertificate        string      `toml:"ssl_certificate"`
 	SSLCertificateKey     string      `toml:"ssl_certificate_key"`
+	LogLevel              string      `toml:"log_level"`
 	Targets               []Target    `toml:"targets"`
 	CacheConfig           CacheConfig `toml:"cache"`
 }
@@ -100,6 +142,7 @@ type ProxyConfig struct {
 	PollInterval          time.Duration
 	HealthCheckInterval   time.Duration
 	HealthCacheDuration   time.Duration
+	LogLevel              string
 	Targets               map[string]*TargetState
 	HostnameMap           map[string]string        // hostname -> target name
 	InactivityThresholds  map[string]time.Duration // target name -> inactivity threshold
@@ -143,6 +186,7 @@ type CacheStore struct {
 	keyToPath   map[string]string   // cache key -> path
 	accessOrder []string
 	maxEntries  int
+	lastHashes  map[string][]byte // cache key -> last SHA-256 hash of body
 }
 
 func NewCacheStore(rootPath string, ttl time.Duration, maxSize int64, targetPaths map[string][]string, logger Logger) *CacheStore {
@@ -157,6 +201,7 @@ func NewCacheStore(rootPath string, ttl time.Duration, maxSize int64, targetPath
 		keyToPath:   make(map[string]string),
 		accessOrder: []string{},
 		maxEntries:  1000,
+		lastHashes:  make(map[string][]byte),
 	}
 
 	if err := os.MkdirAll(rootPath, 0755); err != nil {
@@ -229,9 +274,22 @@ func (cs *CacheStore) Save(targetName, path string, statusCode int, headers http
 	}
 
 	if int64(len(body)) > cs.maxSize {
-		cs.logger.Info("Response too large for cache (%d bytes) for %s %s", len(body), targetName, path)
+		cs.logger.Error("Response too large for cache (%d bytes) for %s %s", len(body), targetName, path)
 		return
 	}
+
+	bodyHash := sha256.Sum256(body)
+
+	cs.entriesMu.Lock()
+	k := cs.key(targetName, path)
+	if lastHash, exists := cs.lastHashes[k]; exists {
+		if bytes.Equal(lastHash, bodyHash[:]) {
+			cs.entriesMu.Unlock()
+			cs.logger.Debug("Cache unchanged for %s %s, skipping write", targetName, path)
+			return
+		}
+	}
+	cs.entriesMu.Unlock()
 
 	cacheDir := filepath.Join(cs.rootPath, targetName)
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
@@ -267,14 +325,14 @@ func (cs *CacheStore) Save(targetName, path string, statusCode int, headers http
 	}
 
 	cs.entriesMu.Lock()
-	k := cs.key(targetName, path)
 	cs.entries[k] = meta
 	cs.keyToTarget[k] = targetName
 	cs.keyToPath[k] = path
 	cs.addToAccessOrder(k)
+	cs.lastHashes[k] = bodyHash[:]
 	cs.entriesMu.Unlock()
 
-	cs.logger.Info("Cached response for %s %s", targetName, path)
+	cs.logger.Info("Cache updated for %s %s", targetName, path)
 }
 
 func (cs *CacheStore) Get(targetName, path string) (*http.Response, bool) {
@@ -339,6 +397,7 @@ func (cs *CacheStore) InvalidateTarget(targetName string) {
 		delete(cs.entries, k)
 		delete(cs.keyToTarget, k)
 		delete(cs.keyToPath, k)
+		delete(cs.lastHashes, k)
 	}
 
 	cacheDir := filepath.Join(cs.rootPath, targetName)
@@ -443,6 +502,7 @@ func (cs *CacheStore) Cleanup() {
 		delete(cs.entries, k)
 		delete(cs.keyToTarget, k)
 		delete(cs.keyToPath, k)
+		delete(cs.lastHashes, k)
 
 		// Also remove the expired files from disk, not just the in-memory bookkeeping.
 		if targetName != "" && path != "" {
@@ -1336,11 +1396,11 @@ func (p *ProxyService) warmCache(targetName string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	p.logger.Info("Starting cache warmup for target: %s", targetName)
+	p.logger.Debug("Starting cache warmup for target: %s", targetName)
 
 	cachedPaths := p.cache.GetCachedPathsForTarget(targetName)
 	if len(cachedPaths) == 0 {
-		p.logger.Info("No cached paths to warm for target: %s", targetName)
+		p.logger.Debug("No cached paths to warm for target: %s", targetName)
 		return
 	}
 
@@ -1376,7 +1436,7 @@ func (p *ProxyService) warmCache(targetName string) {
 	for _, path := range cachedPaths {
 		select {
 		case <-ctx.Done():
-			p.logger.Info("Cache warmup cancelled for target: %s", targetName)
+			p.logger.Debug("Cache warmup cancelled for target: %s", targetName)
 			return
 		case <-time.After(100 * time.Millisecond):
 		}
@@ -1386,13 +1446,13 @@ func (p *ProxyService) warmCache(targetName string) {
 
 		req, err := http.NewRequestWithContext(ctx, "GET", reqURL.String(), nil)
 		if err != nil {
-			p.logger.Info("Failed to create request for %s %s: %v", targetName, path, err)
+			p.logger.Error("Failed to create request for %s %s: %v", targetName, path, err)
 			continue
 		}
 
 		resp, err := client.Do(req)
 		if err != nil {
-			p.logger.Info("Failed to warm cache for %s %s: %v", targetName, path, err)
+			p.logger.Error("Failed to warm cache for %s %s: %v", targetName, path, err)
 			continue
 		}
 
@@ -1408,7 +1468,7 @@ func (p *ProxyService) warmCache(targetName string) {
 		}
 	}
 
-	p.logger.Info("Cache warmup completed for target: %s", targetName)
+	p.logger.Debug("Cache warmup completed for target: %s", targetName)
 }
 
 func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, target *Target) {
@@ -1660,6 +1720,7 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		PollInterval:          pollInterval,
 		HealthCheckInterval:   healthCheckInterval,
 		HealthCacheDuration:   healthCacheDuration,
+		LogLevel:              config.LogLevel,
 		Targets:               targets,
 		HostnameMap:           hostnameMap,
 		InactivityThresholds:  inactivityThresholds,
@@ -1673,14 +1734,30 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 }
 
 // Simple logger implementation
-type StdLogger struct{}
+type StdLogger struct {
+	level LogLevel
+}
+
+func (l *StdLogger) shouldLog(level LogLevel) bool {
+	return l.level <= level
+}
 
 func (l *StdLogger) Info(msg string, args ...interface{}) {
-	log.Printf("[INFO] "+msg, args...)
+	if l.shouldLog(LogLevelInfo) {
+		log.Printf("[INFO] "+msg, args...)
+	}
 }
 
 func (l *StdLogger) Error(msg string, args ...interface{}) {
-	log.Printf("[ERROR] "+msg, args...)
+	if l.shouldLog(LogLevelError) {
+		log.Printf("[ERROR] "+msg, args...)
+	}
+}
+
+func (l *StdLogger) Debug(msg string, args ...interface{}) {
+	if l.shouldLog(LogLevelDebug) {
+		log.Printf("[DEBUG] "+msg, args...)
+	}
 }
 
 // Main function
@@ -1698,7 +1775,7 @@ func main() {
 	}
 
 	// Initialize dependencies
-	logger := &StdLogger{}
+	logger := &StdLogger{level: ParseLogLevel(config.LogLevel)}
 	healthChecker := NewHTTPHealthChecker(logger)
 	wolSender := NewUDPWOLSender(logger)
 	sshExecutor := NewDefaultSSHExecutor(logger)
