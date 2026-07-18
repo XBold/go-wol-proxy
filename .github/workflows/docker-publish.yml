@@ -3,11 +3,6 @@ name: Docker Build and Publish
 on:
   push:
     branches: [ main, develop ]
-    paths:
-      - '**/*.go'
-      - 'go.mod'
-      - 'go.sum'
-      - 'Dockerfile'
 
 env:
   REGISTRY: ghcr.io
