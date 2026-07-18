@@ -769,12 +769,13 @@ func (w *UDPWOLSender) createMagicPacket(mac net.HardwareAddr) []byte {
 
 // Main proxy service
 type ProxyService struct {
-	config        *ProxyConfig
-	healthChecker HealthChecker
-	wolSender     WOLSender
-	sshExecutor   SSHExecutor
-	logger        Logger
-	cache         *CacheStore
+	config         *ProxyConfig
+	healthChecker  HealthChecker
+	wolSender      WOLSender
+	sshExecutor    SSHExecutor
+	logger         Logger
+	cache          *CacheStore
+	proxyTransport *http.Transport
 }
 
 func NewProxyService(
@@ -785,13 +786,40 @@ func NewProxyService(
 	logger Logger,
 	cache *CacheStore,
 ) *ProxyService {
+	// A single shared transport is reused across all proxied requests (for all
+	// targets - Go's Transport already pools connections per scheme+host, so one
+	// instance is enough). Creating a fresh *http.Transport per request would mean
+	// no keep-alive connection reuse and, since http.Transport has no finalizer
+	// that closes idle connections when garbage collected, a slow leak of open
+	// sockets under sustained traffic.
+	proxyTransport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   60 * time.Second, // Increased timeout for slow connections
+			KeepAlive: 60 * time.Second, // Increased keep-alive
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       120 * time.Second, // Increased idle timeout
+		TLSHandshakeTimeout:   20 * time.Second,  // Increased TLS handshake timeout
+		ExpectContinueTimeout: 5 * time.Second,   // Increased expect-continue timeout
+		MaxIdleConnsPerHost:   10,
+		// Disable compression to avoid issues with already compressed data
+		DisableCompression:    true,
+		ResponseHeaderTimeout: config.ResponseHeaderTimeout,
+		// No timeout for reading the entire response
+		ReadBufferSize:  1024 * 1024, // 1MB buffer for reading
+		WriteBufferSize: 1024 * 1024, // 1MB buffer for writing
+	}
+
 	return &ProxyService{
-		config:        config,
-		healthChecker: healthChecker,
-		wolSender:     wolSender,
-		sshExecutor:   sshExecutor,
-		logger:        logger,
-		cache:         cache,
+		config:         config,
+		healthChecker:  healthChecker,
+		wolSender:      wolSender,
+		sshExecutor:    sshExecutor,
+		logger:         logger,
+		cache:          cache,
+		proxyTransport: proxyTransport,
 	}
 }
 
@@ -806,7 +834,7 @@ func (p *ProxyService) shutdownTarget(targetName string) error {
 		return fmt.Errorf("target %s is missing SSH configuration or shutdown command or shutdown HTTP URL", targetName)
 	}
 
-	p.logger.Info("Shutting down target %s (%s) due to inactivity")
+	p.logger.Info("Shutting down target %s (%s) due to inactivity", targetName, target.Hostname)
 	if target.ShutdownHTTPUrl != "" {
 		// Attempt to shut down via HTTP request
 		method := target.ShutdownHTTPMethod
@@ -851,6 +879,7 @@ func (p *ProxyService) shutdownTarget(targetName string) error {
 	targetState.IsHealthy = false
 	targetState.mu.Unlock()
 	p.healthChecker.CloseIdleConnections()
+	p.proxyTransport.CloseIdleConnections()
 
 	p.logger.Info("Target %s (%s) has been shut down", targetName, target.Hostname)
 	return nil
@@ -1054,6 +1083,8 @@ func (p *ProxyService) serveAndWaitForShutdown(ctx context.Context, server *http
 		if p.cache != nil {
 			p.cache.Close()
 		}
+		p.proxyTransport.CloseIdleConnections()
+		p.healthChecker.CloseIdleConnections()
 
 		p.logger.Info("Server stopped gracefully")
 		return nil
@@ -1395,28 +1426,7 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, targ
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-
-	// Create a custom transport with optimized settings for large uploads
-	proxy.Transport = &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   60 * time.Second, // Increased timeout for slow connections
-			KeepAlive: 60 * time.Second, // Increased keep-alive
-			DualStack: true,
-		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       120 * time.Second, // Increased idle timeout
-		TLSHandshakeTimeout:   20 * time.Second,  // Increased TLS handshake timeout
-		ExpectContinueTimeout: 5 * time.Second,   // Increased expect-continue timeout
-		MaxIdleConnsPerHost:   10,
-		// Disable compression to avoid issues with already compressed data
-		DisableCompression:    true,
-		ResponseHeaderTimeout: p.config.ResponseHeaderTimeout,
-		// No timeout for reading the entire response
-		ReadBufferSize:  1024 * 1024, // 1MB buffer for reading
-		WriteBufferSize: 1024 * 1024, // 1MB buffer for writing
-	}
+	proxy.Transport = p.proxyTransport
 
 	// Customize the proxy to handle errors and logging
 	originalDirector := proxy.Director
@@ -1603,11 +1613,14 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		if _, err := net.ParseMAC(target.MacAddress); err != nil {
 			return nil, fmt.Errorf("target %s has invalid mac_address %q: %w", target.Name, target.MacAddress, err)
 		}
-		if _, err := net.ResolveTCPAddr("udp", fmt.Sprintf("%s:0", target.BroadcastIP)); err != nil {
+		if _, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:0", target.BroadcastIP)); err != nil {
 			return nil, fmt.Errorf("target %s has invalid broadcast_ip %q: %w", target.Name, target.BroadcastIP, err)
 		}
 		if target.WolPort != 0 && (target.WolPort < 1 || target.WolPort > 65535) {
 			return nil, fmt.Errorf("target %s has invalid wol_port %d (must be 1-65535 or 0 for default)", target.Name, target.WolPort)
+		}
+		if target.WolPort == 0 {
+			target.WolPort = 9 // standard Wake-on-LAN port
 		}
 
 		// Validate shutdown configuration
