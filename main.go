@@ -1814,7 +1814,8 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 
 // Simple logger implementation
 type StdLogger struct {
-	level LogLevel
+	level    LogLevel
+	location *time.Location
 }
 
 func (l *StdLogger) shouldLog(level LogLevel) bool {
@@ -1823,19 +1824,19 @@ func (l *StdLogger) shouldLog(level LogLevel) bool {
 
 func (l *StdLogger) Info(msg string, args ...interface{}) {
 	if l.shouldLog(LogLevelInfo) {
-		log.Printf("[INFO] "+msg, args...)
+		log.Printf("[INFO] %s "+msg, append([]interface{}{time.Now().In(l.location).Format("2006-01-02 15:04:05")}, args...)...)
 	}
 }
 
 func (l *StdLogger) Error(msg string, args ...interface{}) {
 	if l.shouldLog(LogLevelError) {
-		log.Printf("[ERROR] "+msg, args...)
+		log.Printf("[ERROR] %s "+msg, append([]interface{}{time.Now().In(l.location).Format("2006-01-02 15:04:05")}, args...)...)
 	}
 }
 
 func (l *StdLogger) Debug(msg string, args ...interface{}) {
 	if l.shouldLog(LogLevelDebug) {
-		log.Printf("[DEBUG] "+msg, args...)
+		log.Printf("[DEBUG] %s "+msg, append([]interface{}{time.Now().In(l.location).Format("2006-01-02 15:04:05")}, args...)...)
 	}
 }
 
@@ -1854,7 +1855,17 @@ func main() {
 	}
 
 	// Initialize dependencies
-	logger := &StdLogger{level: ParseLogLevel(config.LogLevel)}
+	tz := os.Getenv("TZ")
+	if tz == "" {
+		tz = "UTC"
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		log.Printf("Invalid timezone %q, defaulting to UTC: %v", tz, err)
+		tz = "UTC"
+		loc = time.UTC
+	}
+	logger := &StdLogger{level: ParseLogLevel(config.LogLevel), location: loc}
 	healthChecker := NewHTTPHealthChecker(logger)
 	wolSender := NewUDPWOLSender(logger)
 	sshExecutor := NewDefaultSSHExecutor(logger)
