@@ -109,7 +109,8 @@ type Target struct {
 	HealthEndpoint       string `toml:"health_endpoint"`
 	MacAddress           string `toml:"mac_address"`
 	BroadcastIP          string `toml:"broadcast_ip"`
-	WolPort              int    `toml:"wol_port"`
+	WolPort         int `toml:"wol_port"`
+	WOLBurstCount   int `toml:"wol_burst_count"`
 	SSHHost              string `toml:"ssh_host"`
 	SSHUser              string `toml:"ssh_user"`
 	SSHKeyPath           string `toml:"ssh_key_path"`
@@ -809,7 +810,7 @@ func (w *UDPWOLSender) SendWOL(macAddr, broadcastIP string, port int) error {
 		return fmt.Errorf("failed to send WOL packet: %w", err)
 	}
 
-	w.logger.Info("WOL packet sent to %s via %s:%d", macAddr, broadcastIP, port)
+	w.logger.Debug("WOL packet sent to %s via %s:%d", macAddr, broadcastIP, port)
 	return nil
 }
 
@@ -1347,6 +1348,15 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState, wak
 	wakeStartTime := time.Now()
 	waitDuration := p.config.StartupTime
 	burstCount := 3
+	if target.Target.WOLBurstCount > 0 {
+		if target.Target.WOLBurstCount < 1 {
+			burstCount = 1
+		} else if target.Target.WOLBurstCount > 10 {
+			burstCount = 10
+		} else {
+			burstCount = target.Target.WOLBurstCount
+		}
+	}
 	burstInterval := 500 * time.Millisecond
 
 	giveUp := func(err error) error {
@@ -1368,7 +1378,7 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState, wak
 				target.Target.WolPort,
 			); err != nil {
 				p.logger.Error("Failed to send WOL packet during burst: %v", err)
-			} else if i > 0 {
+			} else {
 				p.logger.Info("Sent WOL burst packet %d/%d to %s (%s)",
 					i+1, burstCount, target.Target.Name, target.Target.Hostname)
 			}
