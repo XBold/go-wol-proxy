@@ -1174,7 +1174,7 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if we have fresh health data
-	cached, reason := p.healthCacheStatus(targetState)
+	cached, reason := p.healthCacheStatus(r.Context(), targetName, targetState)
 	if cached {
 		p.logger.Info("Target %s is healthy, proxying immediately", targetName)
 		p.proxyRequest(w, r, targetState.Target)
@@ -1228,29 +1228,59 @@ func (p *ProxyService) extractTarget(r *http.Request) string {
 	return ""
 }
 
-func (p *ProxyService) healthCacheStatus(target *TargetState) (cached bool, reason string) {
+// healthCacheStatus reports whether the target can be treated as healthy
+// right now. If the last background check marked it healthy but that check
+// has aged past health_cache_duration, we don't immediately assume it's
+// down - background checks only run every health_check_interval, so if
+// health_check_interval > health_cache_duration there would otherwise be a
+// recurring window (between the two durations) where a perfectly healthy
+// target is wrongly treated as down and a WOL burst is fired for no reason.
+// Instead we perform a quick synchronous re-check here before giving up.
+func (p *ProxyService) healthCacheStatus(ctx context.Context, targetName string, target *TargetState) (cached bool, reason string) {
 	target.mu.RLock()
-	defer target.mu.RUnlock()
+	wasHealthy := target.IsHealthy
+	lastCheck := target.LastCheck
+	target.mu.RUnlock()
 
-	if !target.IsHealthy {
-		if target.LastCheck.IsZero() {
+	if !wasHealthy {
+		if lastCheck.IsZero() {
 			return false, "no prior health check"
 		}
 		return false, fmt.Sprintf(
 			"marked unhealthy (last check %v ago)",
-			time.Since(target.LastCheck).Round(time.Second),
+			time.Since(lastCheck).Round(time.Second),
 		)
 	}
 
-	age := time.Since(target.LastCheck)
-	if age > p.config.HealthCacheDuration {
-		return false, fmt.Sprintf(
-			"cached health expired (last check %v ago, cache duration %v)",
-			age.Round(time.Second), p.config.HealthCacheDuration,
-		)
+	age := time.Since(lastCheck)
+	if age <= p.config.HealthCacheDuration {
+		return true, ""
 	}
 
-	return true, ""
+	// Cached health is stale but the target was healthy as of the last
+	// check. Do an on-demand check (short timeout) instead of assuming down.
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	healthy := p.healthChecker.Check(checkCtx, target.Target.HealthEndpoint, "on-demand")
+
+	target.mu.Lock()
+	target.IsHealthy = healthy
+	target.LastCheck = time.Now()
+	target.mu.Unlock()
+
+	if healthy {
+		p.logger.Debug("On-demand health re-check for %s succeeded (stale cache: last check %v ago)",
+			targetName, age.Round(time.Second))
+		return true, ""
+	}
+
+	p.logger.Info("On-demand health re-check for %s failed (last background check %v ago)",
+		targetName, age.Round(time.Second))
+	return false, fmt.Sprintf(
+		"on-demand health check failed (last background check %v ago, cache duration %v)",
+		age.Round(time.Second), p.config.HealthCacheDuration,
+	)
 }
 
 func (p *ProxyService) wakeAndWait(ctx context.Context, target *TargetState) (int, error) {
