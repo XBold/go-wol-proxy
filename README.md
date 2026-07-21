@@ -20,7 +20,6 @@ The service is configured using a TOML file. Here's an example configuration:
 port = ":8080"                  # Port to listen on
 timeout = "1m"                  # How long to wait for server to wake up
 response_header_timeout = "1m"  # How long to wait for a response header, e.g. during or after slow or long-running requests/uploads
-poll_interval = "5s"            # How often to check health during wake-up
 health_check_interval = "30s"   # Background health check frequency
 health_cache_duration = "10s"   # How long to trust cached health status
 

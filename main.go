@@ -93,7 +93,6 @@ type Config struct {
 	Timeout               string      `toml:"timeout"`
 	StartupTime           string      `toml:"startup_time"`
 	ResponseHeaderTimeout string      `toml:"response_header_timeout"`
-	PollInterval          string      `toml:"poll_interval"`
 	HealthCheckInterval   string      `toml:"health_check_interval"`
 	HealthCacheDuration   string      `toml:"health_cache_duration"`
 	SSLCertificate        string      `toml:"ssl_certificate"`
@@ -141,7 +140,6 @@ type ProxyConfig struct {
 	Timeout               time.Duration
 	StartupTime           time.Duration
 	ResponseHeaderTimeout time.Duration
-	PollInterval          time.Duration
 	HealthCheckInterval   time.Duration
 	HealthCacheDuration   time.Duration
 	LogLevel              string
@@ -164,6 +162,8 @@ type TargetState struct {
 	LastCheck    time.Time
 	IsWaking     bool
 	wakeGen      int // monotonically increasing generation counter for wake operations
+	wakeDone     chan struct{} // closed when the in-flight wake for wakeGen completes
+	wakeErr      error         // result of the in-flight/most recently completed wake
 	LastActivity time.Time
 	mu           sync.RWMutex
 }
@@ -1256,19 +1256,19 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, target *TargetState) (in
 	target.mu.Lock()
 	if target.IsWaking {
 		gen := target.wakeGen
+		done := target.wakeDone
 		target.mu.Unlock()
 		p.logger.Info("Target %s (%s) wake already in progress, joining existing wait (gen=%d)",
 			target.Target.Name, target.Target.Hostname, gen)
-		return gen, p.waitForWake(ctx, target, gen)
+		return gen, p.joinWake(ctx, target, gen, done)
 	}
 
 	target.wakeGen++
 	gen := target.wakeGen
 	target.IsWaking = true
-	target.mu.Unlock()
-
-	target.mu.Lock()
 	target.LastActivity = time.Now()
+	done := make(chan struct{})
+	target.wakeDone = done
 	target.mu.Unlock()
 
 	if err := p.wolSender.SendWOL(
@@ -1276,25 +1276,91 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, target *TargetState) (in
 		target.Target.BroadcastIP,
 		target.Target.WolPort,
 	); err != nil {
+		wrapped := fmt.Errorf("failed to send WOL: %w", err)
 		target.mu.Lock()
 		target.IsWaking = false
+		target.wakeErr = wrapped
+		close(done)
 		target.mu.Unlock()
-		return 0, fmt.Errorf("failed to send WOL: %w", err)
+		return 0, wrapped
 	}
 
 	p.logger.Info("WOL packet sent to %s (%s), waiting for server to wake (gen=%d)",
 		target.Target.Name, target.Target.Hostname, gen)
 
-	return gen, p.waitForWake(ctx, target, gen)
+	err := p.waitForWake(ctx, target, gen)
+
+	// waitForWake already resets IsWaking on every return path; here we just
+	// record the outcome and release anyone who joined this wake generation.
+	target.mu.Lock()
+	target.wakeErr = err
+	close(done)
+	target.mu.Unlock()
+
+	return gen, err
 }
 
+// joinWake is used by requests that arrive while another goroutine is already
+// waking the target for the same generation. Previously, joining requests
+// independently re-ran the full WOL burst + health-poll loop, so N concurrent
+// requests produced N-fold WOL packets and N-fold health checks against the
+// target (visible in the logs as repeated "Sent WOL burst packet x/3" and
+// "Cache invalidated" lines at the same timestamp). Instead, a joiner now
+// just waits for the in-flight wake to finish and reuses its result.
+func (p *ProxyService) joinWake(ctx context.Context, target *TargetState, gen int, done chan struct{}) error {
+	if done == nil {
+		return fmt.Errorf("no in-flight wake to join for %s", target.Target.Name)
+	}
+
+	select {
+	case <-done:
+		target.mu.RLock()
+		err := target.wakeErr
+		healthy := target.IsHealthy
+		currentGen := target.wakeGen
+		target.mu.RUnlock()
+
+		if currentGen != gen {
+			return fmt.Errorf("wake aborted: generation changed (was %d, now %d)", gen, currentGen)
+		}
+		if healthy {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("wake failed for %s", target.Target.Name)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// waitForWake repeatedly sends a burst of WOL packets and waits for the
+// target to come up. Each cycle is strictly: send a burst of burstCount
+// packets 500ms apart, THEN wait the full waitDuration (starting at
+// startup_time, halved on each retry down to a 500ms floor), and only THEN
+// perform a single health check. Checking health immediately after a burst
+// is pointless - the machine hasn't had time to boot - so no check happens
+// until the full wait has elapsed.
 func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState, wakeGen int) error {
 	timeout := time.After(p.config.Timeout)
 	wakeStartTime := time.Now()
 	waitDuration := p.config.StartupTime
 	burstCount := 3
+	burstInterval := 500 * time.Millisecond
 
-	sendWOLBurst := func() {
+	giveUp := func(err error) error {
+		target.mu.Lock()
+		if target.wakeGen == wakeGen {
+			target.IsWaking = false
+		}
+		target.mu.Unlock()
+		return err
+	}
+
+	// sendWOLBurst sends burstCount WOL packets burstInterval apart. It
+	// returns early (with ctx.Err()) if the context is cancelled mid-burst.
+	sendWOLBurst := func() error {
 		for i := 0; i < burstCount; i++ {
 			if err := p.wolSender.SendWOL(
 				target.Target.MacAddress,
@@ -1307,117 +1373,71 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState, wak
 					i+1, burstCount, target.Target.Name, target.Target.Hostname)
 			}
 			if i < burstCount-1 {
-				time.Sleep(500 * time.Millisecond)
-			}
-		}
-	}
-
-	sendWOLBurst()
-
-	for {
-		select {
-		case <-ctx.Done():
-			target.mu.Lock()
-			if target.wakeGen == wakeGen {
-				target.IsWaking = false
-			}
-			target.mu.Unlock()
-			return ctx.Err()
-		case <-timeout:
-			target.mu.Lock()
-			if target.wakeGen == wakeGen {
-				target.IsWaking = false
-			}
-			target.mu.Unlock()
-			return fmt.Errorf("timeout waiting for %s to wake up after %v",
-				target.Target.Name, p.config.Timeout)
-		default:
-			target.mu.RLock()
-			currentGen := target.wakeGen
-			target.mu.RUnlock()
-
-			if currentGen != wakeGen {
-				p.logger.Info("Wake generation changed (old=%d, new=%d), abandoning wait for %s",
-					wakeGen, currentGen, target.Target.Name)
-				return fmt.Errorf("wake aborted: generation changed (was %d, now %d)", wakeGen, currentGen)
-			}
-
-			if p.healthChecker.Check(ctx, target.Target.HealthEndpoint, "wake") {
-				target.mu.Lock()
-				target.IsHealthy = true
-				target.LastCheck = time.Now()
-				target.IsWaking = false
-				target.mu.Unlock()
-
-				wakeDuration := time.Since(wakeStartTime)
-				p.logger.Info("Target %s (%s) woke up after %v (gen=%d)",
-					target.Target.Name, target.Target.Hostname, wakeDuration, wakeGen)
-
-				if p.cache != nil && p.config.CacheEnabled {
-					p.cache.InvalidateTarget(target.Target.Name)
-				}
-
-				return nil
-			}
-
-			select {
-			case <-ctx.Done():
-				target.mu.Lock()
-				if target.wakeGen == wakeGen {
-					target.IsWaking = false
-				}
-				target.mu.Unlock()
-				return ctx.Err()
-			case <-timeout:
-				target.mu.Lock()
-				if target.wakeGen == wakeGen {
-					target.IsWaking = false
-				}
-				target.mu.Unlock()
-				return fmt.Errorf("timeout waiting for %s to wake up after %v",
-					target.Target.Name, p.config.Timeout)
-			case <-time.After(waitDuration):
-				if p.healthChecker.Check(ctx, target.Target.HealthEndpoint, "wake") {
-					target.mu.Lock()
-					target.IsHealthy = true
-					target.LastCheck = time.Now()
-					target.IsWaking = false
-					target.mu.Unlock()
-
-					wakeDuration := time.Since(wakeStartTime)
-					p.logger.Info("Target %s (%s) woke up after %v (gen=%d)",
-						target.Target.Name, target.Target.Hostname, wakeDuration, wakeGen)
-
-					if p.cache != nil && p.config.CacheEnabled {
-						p.cache.InvalidateTarget(target.Target.Name)
-					}
-
-					return nil
-				}
-
 				select {
 				case <-ctx.Done():
-					target.mu.Lock()
-					if target.wakeGen == wakeGen {
-						target.IsWaking = false
-					}
-					target.mu.Unlock()
 					return ctx.Err()
 				case <-timeout:
-					target.mu.Lock()
-					if target.wakeGen == wakeGen {
-						target.IsWaking = false
-					}
-					target.mu.Unlock()
 					return fmt.Errorf("timeout waiting for %s to wake up after %v",
 						target.Target.Name, p.config.Timeout)
-				default:
-					sendWOLBurst()
-					waitDuration = waitDuration / 2
-					if waitDuration < 500*time.Millisecond {
-						waitDuration = 500 * time.Millisecond
-					}
+				case <-time.After(burstInterval):
 				}
+			}
+		}
+		return nil
+	}
+
+	for {
+		target.mu.RLock()
+		currentGen := target.wakeGen
+		target.mu.RUnlock()
+
+		if currentGen != wakeGen {
+			p.logger.Info("Wake generation changed (old=%d, new=%d), abandoning wait for %s",
+				wakeGen, currentGen, target.Target.Name)
+			return giveUp(fmt.Errorf("wake aborted: generation changed (was %d, now %d)", wakeGen, currentGen))
+		}
+
+		if err := sendWOLBurst(); err != nil {
+			return giveUp(err)
+		}
+
+		select {
+		case <-ctx.Done():
+			return giveUp(ctx.Err())
+		case <-timeout:
+			return giveUp(fmt.Errorf("timeout waiting for %s to wake up after %v",
+				target.Target.Name, p.config.Timeout))
+		case <-time.After(waitDuration):
+		}
+
+		if p.healthChecker.Check(ctx, target.Target.HealthEndpoint, "wake") {
+			target.mu.Lock()
+			target.IsHealthy = true
+			target.LastCheck = time.Now()
+			target.IsWaking = false
+			target.mu.Unlock()
+
+			wakeDuration := time.Since(wakeStartTime)
+			p.logger.Info("Target %s (%s) woke up after %v (gen=%d)",
+				target.Target.Name, target.Target.Hostname, wakeDuration, wakeGen)
+
+			if p.cache != nil && p.config.CacheEnabled {
+				p.cache.InvalidateTarget(target.Target.Name)
+			}
+
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return giveUp(ctx.Err())
+		case <-timeout:
+			return giveUp(fmt.Errorf("timeout waiting for %s to wake up after %v",
+				target.Target.Name, p.config.Timeout))
+		default:
+			waitDuration = waitDuration / 2
+			if waitDuration < 500*time.Millisecond {
+				waitDuration = 500 * time.Millisecond
 			}
 		}
 	}
@@ -1655,11 +1675,6 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		return nil, fmt.Errorf("invalid response_header_timeout: %w", err)
 	}
 
-	pollInterval, err := time.ParseDuration(config.PollInterval)
-	if err != nil {
-		return nil, fmt.Errorf("invalid poll_interval: %w", err)
-	}
-
 	healthCheckInterval, err := time.ParseDuration(config.HealthCheckInterval)
 	if err != nil {
 		return nil, fmt.Errorf("invalid health_check_interval: %w", err)
@@ -1782,7 +1797,6 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		Timeout:               timeout,
 		StartupTime:           startupTime,
 		ResponseHeaderTimeout: responseHeaderTimeout,
-		PollInterval:          pollInterval,
 		HealthCheckInterval:   healthCheckInterval,
 		HealthCacheDuration:   healthCacheDuration,
 		LogLevel:              config.LogLevel,
