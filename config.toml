@@ -1,9 +1,23 @@
 port = ":8080"                  # Port to listen on
 timeout = "1m"                  # How long to wait for server to wake up
+startup_time = "30s"            # Initial wait time between WOL bursts (must be less than timeout)
 response_header_timeout = "1m"  # How long to wait for a response header, e.g. during or after slow or long-running requests/uploads
-poll_interval = "5s"            # How often to check health during wake-up
 health_check_interval = "30s"   # Background health check frequency
 health_cache_duration = "10s"   # How long to trust cached health status
+log_level = "info"              # Log level: debug, info, warn, error
+
+# Cache configuration (optional)
+# When the destination is offline, cached responses are served instead of triggering WOL
+[cache]
+enabled = false                              # Enable static response caching
+root_path = "./cache"                        # Directory to store cached responses
+ttl = "24h"                                  # How long cached entries remain valid
+max_response_size_bytes = 10485760           # Maximum response size to cache (10MB)
+warm_interval = "30m"                        # How often to refresh cache when target is healthy
+
+[[cache.targets]]
+target = "service"                           # Target name (must match a target's name field)
+paths = ["/docs", "/assets", "/static/*"]    # Paths to cache (supports /* wildcard)
 
 [[targets]]
 name = "service"
@@ -13,10 +27,12 @@ health_endpoint = "http://service.local/ping" # url to check health
 mac_address = "7c:8b:ad:da:be:51"             # MAC address for WOL
 broadcast_ip = "10.0.0.255"                   # Broadcast IP for WOL
 wol_port = 9                                  # Port for WOL packets
+wol_burst_count = 3                           # Number of WOL packets per burst (1-10, default 3; set to 1 for single packet)
 inactivity_threshold = "1h"                   # Shut down after 1 hour of inactivity
 ssh_host = "service.local:22"                 # SSH host:port for shutdown
 ssh_user = "wol-proxy"                        # SSH username for shutdown
 ssh_key_path = "/home/ilmars/.ssh/id_rsa"     # Path to SSH private key
+ssh_known_hosts = "/home/ilmars/.ssh/known_hosts"  # Path to known_hosts file (optional, omits host key verification if unset)
 shutdown_command = "sudo shutdown -h now"     # Command to execute for shutdown
 
 [[targets]]

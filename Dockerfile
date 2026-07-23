@@ -19,6 +19,9 @@ FROM alpine:3.22
 
 WORKDIR /app
 
+# Install timezone data so Go can load custom timezones (e.g., Europe/Rome)
+RUN apk --no-cache add tzdata
+
 # Copy the binary from the builder stage
 COPY --from=builder /app/go-wol-proxy /app/
 

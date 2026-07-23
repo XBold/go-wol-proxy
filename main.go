@@ -3,22 +3,67 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/BurntSushi/toml"
 	"golang.org/x/crypto/ssh"
 )
+
+// Log levels
+type LogLevel int
+
+const (
+	LogLevelDebug LogLevel = iota
+	LogLevelInfo
+	LogLevelWarn
+	LogLevelError
+)
+
+func ParseLogLevel(s string) LogLevel {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "debug", "dbg":
+		return LogLevelDebug
+	case "warn", "warning":
+		return LogLevelWarn
+	case "error", "err":
+		return LogLevelError
+	case "info", "inf", "":
+		return LogLevelInfo
+	default:
+		return LogLevelInfo
+	}
+}
+
+func (l LogLevel) String() string {
+	switch l {
+	case LogLevelDebug:
+		return "debug"
+	case LogLevelInfo:
+		return "info"
+	case LogLevelWarn:
+		return "warn"
+	case LogLevelError:
+		return "error"
+	default:
+		return "info"
+	}
+}
 
 // Interfaces for dependency injection
 type HealthChecker interface {
@@ -33,25 +78,28 @@ type WOLSender interface {
 }
 
 type SSHExecutor interface {
-	ExecuteCommand(host, user, keyPath, command string) error
+	ExecuteCommand(host, user, keyPath, knownHosts, command string) error
 }
 
 type Logger interface {
 	Info(msg string, args ...interface{})
 	Error(msg string, args ...interface{})
+	Debug(msg string, args ...interface{})
 }
 
 // Config structs
 type Config struct {
-	Port                  string   `toml:"port"`
-	Timeout               string   `toml:"timeout"`
-	ResponseHeaderTimeout string   `toml:"response_header_timeout"`
-	PollInterval          string   `toml:"poll_interval"`
-	HealthCheckInterval   string   `toml:"health_check_interval"`
-	HealthCacheDuration   string   `toml:"health_cache_duration"`
-	SSLCertificate        string   `toml:"ssl_certificate"`
-	SSLCertificateKey     string   `toml:"ssl_certificate_key"`
-	Targets               []Target `toml:"targets"`
+	Port                  string      `toml:"port"`
+	Timeout               string      `toml:"timeout"`
+	StartupTime           string      `toml:"startup_time"`
+	ResponseHeaderTimeout string      `toml:"response_header_timeout"`
+	HealthCheckInterval   string      `toml:"health_check_interval"`
+	HealthCacheDuration   string      `toml:"health_cache_duration"`
+	SSLCertificate        string      `toml:"ssl_certificate"`
+	SSLCertificateKey     string      `toml:"ssl_certificate_key"`
+	LogLevel              string      `toml:"log_level"`
+	Targets               []Target    `toml:"targets"`
+	CacheConfig           CacheConfig `toml:"cache"`
 }
 
 type Target struct {
@@ -61,10 +109,12 @@ type Target struct {
 	HealthEndpoint       string `toml:"health_endpoint"`
 	MacAddress           string `toml:"mac_address"`
 	BroadcastIP          string `toml:"broadcast_ip"`
-	WolPort              int    `toml:"wol_port"`
+	WolPort         int `toml:"wol_port"`
+	WOLBurstCount   int `toml:"wol_burst_count"`
 	SSHHost              string `toml:"ssh_host"`
 	SSHUser              string `toml:"ssh_user"`
 	SSHKeyPath           string `toml:"ssh_key_path"`
+	SSHKnownHosts        string `toml:"ssh_known_hosts"`
 	ShutdownCommand      string `toml:"shutdown_command"`
 	ShutdownHTTPUrl      string `toml:"shutdown_http_url"`
 	ShutdownHTTPMethod   string `toml:"shutdown_http_method"`
@@ -72,18 +122,39 @@ type Target struct {
 	InactivityThreshold  string `toml:"inactivity_threshold"`
 }
 
+type CacheConfig struct {
+	Enabled              bool                `toml:"enabled"`
+	RootPath             string              `toml:"root_path"`
+	TTL                  string              `toml:"ttl"`
+	MaxResponseSizeBytes int64               `toml:"max_response_size_bytes"`
+	WarmInterval         string              `toml:"warm_interval"`
+	Targets              []CacheTargetConfig `toml:"targets"`
+}
+
+type CacheTargetConfig struct {
+	Target string   `toml:"target"`
+	Paths  []string `toml:"paths"`
+}
+
 type ProxyConfig struct {
 	Port                  string
 	Timeout               time.Duration
+	StartupTime           time.Duration
 	ResponseHeaderTimeout time.Duration
-	PollInterval          time.Duration
 	HealthCheckInterval   time.Duration
 	HealthCacheDuration   time.Duration
+	LogLevel              string
 	Targets               map[string]*TargetState
 	HostnameMap           map[string]string        // hostname -> target name
 	InactivityThresholds  map[string]time.Duration // target name -> inactivity threshold
 	SSLCertificate        string
 	SSLCertificateKey     string
+	CacheEnabled          bool
+	CacheRootPath         string
+	CacheTTL              time.Duration
+	CacheMaxResponseSize  int64
+	CacheWarmInterval     time.Duration
+	CachePaths            map[string][]string // target name -> list of cached paths
 }
 
 type TargetState struct {
@@ -91,8 +162,366 @@ type TargetState struct {
 	IsHealthy    bool
 	LastCheck    time.Time
 	IsWaking     bool
+	wakeGen      int // monotonically increasing generation counter for wake operations
+	wakeDone     chan struct{} // closed when the in-flight wake for wakeGen completes
+	wakeErr      error         // result of the in-flight/most recently completed wake
 	LastActivity time.Time
 	mu           sync.RWMutex
+}
+
+type cacheEntry struct {
+	StatusCode int                 `json:"status_code"`
+	Headers    map[string][]string `json:"headers"`
+	Body       []byte              `json:"-"`
+	Timestamp  time.Time           `json:"timestamp"`
+	Path       string              `json:"path"`
+}
+
+type CacheStore struct {
+	rootPath    string
+	ttl         time.Duration
+	maxSize     int64
+	logger      Logger
+	entriesMu   sync.RWMutex
+	entries     map[string]*cacheEntry
+	targetPaths map[string][]string // target name -> list of patterns
+	keyToTarget map[string]string   // cache key -> target name
+	keyToPath   map[string]string   // cache key -> path
+	accessOrder []string
+	maxEntries  int
+	lastHashes  map[string][]byte // cache key -> last SHA-256 hash of body
+}
+
+func NewCacheStore(rootPath string, ttl time.Duration, maxSize int64, targetPaths map[string][]string, logger Logger) *CacheStore {
+	cs := &CacheStore{
+		rootPath:    rootPath,
+		ttl:         ttl,
+		maxSize:     maxSize,
+		logger:      logger,
+		entries:     make(map[string]*cacheEntry),
+		targetPaths: targetPaths,
+		keyToTarget: make(map[string]string),
+		keyToPath:   make(map[string]string),
+		accessOrder: []string{},
+		maxEntries:  1000,
+		lastHashes:  make(map[string][]byte),
+	}
+
+	if err := os.MkdirAll(rootPath, 0755); err != nil {
+		logger.Error("Failed to create cache directory %s: %v", rootPath, err)
+	}
+
+	cs.loadAll()
+
+	return cs
+}
+
+func (cs *CacheStore) key(targetName, path string) string {
+	hash := sha256.Sum256([]byte(targetName + path))
+	return fmt.Sprintf("%x", hash[:16])
+}
+
+func (cs *CacheStore) cacheFilePath(targetName, path string) string {
+	return filepath.Join(cs.rootPath, targetName, cs.key(targetName, path)+".cache")
+}
+
+func (cs *CacheStore) load(targetName, path string) (*cacheEntry, bool) {
+	path = filepath.Clean(path)
+	if path == "." || path == "" {
+		return nil, false
+	}
+
+	cacheFile := cs.cacheFilePath(targetName, path)
+
+	data, err := os.ReadFile(cacheFile)
+	if err != nil {
+		return nil, false
+	}
+
+	var entry cacheEntry
+	metaFile := cacheFile + ".meta"
+	metaData, err := os.ReadFile(metaFile)
+	if err != nil {
+		return nil, false
+	}
+
+	if err := json.Unmarshal(metaData, &entry); err != nil {
+		return nil, false
+	}
+
+	entry.Body = data
+
+	if time.Since(entry.Timestamp) > cs.ttl {
+		os.Remove(cacheFile)
+		os.Remove(metaFile)
+		return nil, false
+	}
+
+	cs.entriesMu.Lock()
+	k := cs.key(targetName, path)
+	if _, exists := cs.entries[k]; !exists {
+		cs.entries[k] = &entry
+		cs.keyToTarget[k] = targetName
+		cs.keyToPath[k] = path
+		cs.addToAccessOrder(k)
+	}
+	cs.entriesMu.Unlock()
+
+	return &entry, true
+}
+
+func (cs *CacheStore) Save(targetName, path string, statusCode int, headers http.Header, body []byte) {
+	path = filepath.Clean(path)
+	if path == "." || path == "" {
+		return
+	}
+
+	if int64(len(body)) > cs.maxSize {
+		cs.logger.Error("Response too large for cache (%d bytes) for %s %s", len(body), targetName, path)
+		return
+	}
+
+	bodyHash := sha256.Sum256(body)
+
+	cs.entriesMu.Lock()
+	k := cs.key(targetName, path)
+	if lastHash, exists := cs.lastHashes[k]; exists {
+		if bytes.Equal(lastHash, bodyHash[:]) {
+			cs.entriesMu.Unlock()
+			cs.logger.Debug("Cache unchanged for %s %s, skipping write", targetName, path)
+			return
+		}
+	}
+	cs.entriesMu.Unlock()
+
+	cacheDir := filepath.Join(cs.rootPath, targetName)
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		cs.logger.Error("Failed to create cache directory %s: %v", cacheDir, err)
+		return
+	}
+
+	cacheFile := cs.cacheFilePath(targetName, path)
+	metaFile := cacheFile + ".meta"
+
+	meta := &cacheEntry{
+		StatusCode: statusCode,
+		Headers:    headers,
+		Body:       body,
+		Timestamp:  time.Now(),
+		Path:       path,
+	}
+
+	if err := os.WriteFile(cacheFile, body, 0644); err != nil {
+		cs.logger.Error("Failed to write cache file %s: %v", cacheFile, err)
+		return
+	}
+
+	metaData, err := json.Marshal(meta)
+	if err != nil {
+		cs.logger.Error("Failed to marshal cache metadata: %v", err)
+		return
+	}
+
+	if err := os.WriteFile(metaFile, metaData, 0644); err != nil {
+		cs.logger.Error("Failed to write cache metadata %s: %v", metaFile, err)
+		return
+	}
+
+	cs.entriesMu.Lock()
+	cs.entries[k] = meta
+	cs.keyToTarget[k] = targetName
+	cs.keyToPath[k] = path
+	cs.addToAccessOrder(k)
+	cs.lastHashes[k] = bodyHash[:]
+	cs.entriesMu.Unlock()
+
+	cs.logger.Info("Cache updated for %s %s", targetName, path)
+}
+
+func (cs *CacheStore) Get(targetName, path string) (*http.Response, bool) {
+	entry, ok := cs.load(targetName, path)
+	if !ok {
+		return nil, false
+	}
+
+	resp := &http.Response{
+		StatusCode: entry.StatusCode,
+		Status:     http.StatusText(entry.StatusCode),
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     entry.Headers,
+		Body:       io.NopCloser(bytes.NewReader(entry.Body)),
+	}
+
+	return resp, true
+}
+
+func (cs *CacheStore) GetCachedPathsForTarget(targetName string) []string {
+	cs.entriesMu.RLock()
+	defer cs.entriesMu.RUnlock()
+
+	targetPaths, exists := cs.targetPaths[targetName]
+	if !exists || len(targetPaths) == 0 {
+		return nil
+	}
+
+	var result []string
+	for _, pattern := range targetPaths {
+		if strings.HasSuffix(pattern, "/*") {
+			prefix := strings.TrimSuffix(pattern, "/*")
+			for key := range cs.keyToPath {
+				if cs.keyToTarget[key] == targetName {
+					if p := cs.keyToPath[key]; p != "" && strings.HasPrefix(p, prefix) {
+						result = append(result, p)
+					}
+				}
+			}
+		} else {
+			result = append(result, pattern)
+		}
+	}
+
+	return result
+}
+
+func (cs *CacheStore) InvalidateTarget(targetName string) {
+	cs.entriesMu.Lock()
+	defer cs.entriesMu.Unlock()
+
+	keysToRemove := []string{}
+	for k, t := range cs.keyToTarget {
+		if t == targetName {
+			keysToRemove = append(keysToRemove, k)
+		}
+	}
+
+	for _, k := range keysToRemove {
+		delete(cs.entries, k)
+		delete(cs.keyToTarget, k)
+		delete(cs.keyToPath, k)
+		delete(cs.lastHashes, k)
+	}
+
+	cacheDir := filepath.Join(cs.rootPath, targetName)
+	if err := os.RemoveAll(cacheDir); err != nil {
+		cs.logger.Error("Failed to remove cache directory %s: %v", cacheDir, err)
+	}
+
+	cs.logger.Info("Cache invalidated for target: %s (removed %d entries)", targetName, len(keysToRemove))
+}
+
+func (cs *CacheStore) addToAccessOrder(key string) {
+	for i, k := range cs.accessOrder {
+		if k == key {
+			cs.accessOrder = append(cs.accessOrder[:i], cs.accessOrder[i+1:]...)
+			break
+		}
+	}
+	cs.accessOrder = append(cs.accessOrder, key)
+	for len(cs.accessOrder) > cs.maxEntries {
+		oldest := cs.accessOrder[0]
+		cs.accessOrder = cs.accessOrder[1:]
+		delete(cs.entries, oldest)
+		delete(cs.keyToTarget, oldest)
+		delete(cs.keyToPath, oldest)
+	}
+}
+
+func (cs *CacheStore) loadAll() {
+	targets := make(map[string]bool)
+	for targetName := range cs.targetPaths {
+		targets[targetName] = true
+	}
+
+	for targetName := range targets {
+		dir := filepath.Join(cs.rootPath, targetName)
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+
+		for _, file := range files {
+			if file.IsDir() || !strings.HasSuffix(file.Name(), ".cache") {
+				continue
+			}
+
+			if strings.HasSuffix(file.Name(), ".meta.cache") {
+				continue
+			}
+
+			cacheFile := filepath.Join(dir, file.Name())
+			metaFile := cacheFile + ".meta"
+
+			metaData, err := os.ReadFile(metaFile)
+			if err != nil {
+				continue
+			}
+
+			var entry cacheEntry
+			if err := json.Unmarshal(metaData, &entry); err != nil {
+				continue
+			}
+
+			if time.Since(entry.Timestamp) > cs.ttl {
+				os.Remove(cacheFile)
+				os.Remove(metaFile)
+				continue
+			}
+
+			body, err := os.ReadFile(cacheFile)
+			if err != nil {
+				continue
+			}
+
+			entry.Body = body
+			k := file.Name()[:len(file.Name())-len(".cache")]
+			cs.entries[k] = &entry
+			cs.keyToTarget[k] = targetName
+			cs.keyToPath[k] = entry.Path
+			cs.addToAccessOrder(k)
+		}
+	}
+
+	cs.logger.Info("Loaded %d cache entries", len(cs.entries))
+}
+
+func (cs *CacheStore) Cleanup() {
+	cs.entriesMu.Lock()
+	defer cs.entriesMu.Unlock()
+
+	keysToRemove := []string{}
+
+	for k, entry := range cs.entries {
+		if time.Since(entry.Timestamp) > cs.ttl {
+			keysToRemove = append(keysToRemove, k)
+		}
+	}
+
+	for _, k := range keysToRemove {
+		targetName := cs.keyToTarget[k]
+		path := cs.keyToPath[k]
+
+		delete(cs.entries, k)
+		delete(cs.keyToTarget, k)
+		delete(cs.keyToPath, k)
+		delete(cs.lastHashes, k)
+
+		// Also remove the expired files from disk, not just the in-memory bookkeeping.
+		if targetName != "" && path != "" {
+			cacheFile := cs.cacheFilePath(targetName, path)
+			os.Remove(cacheFile)
+			os.Remove(cacheFile + ".meta")
+		}
+	}
+
+	if len(keysToRemove) > 0 {
+		cs.logger.Info("Cleaned up %d expired cache entries", len(keysToRemove))
+	}
+}
+
+func (cs *CacheStore) Close() {
+	cs.Cleanup()
 }
 
 // HTTP Health Checker implementation
@@ -127,19 +556,19 @@ func (h *HTTPHealthChecker) CloseIdleConnections() {
 func (h *HTTPHealthChecker) Check(ctx context.Context, endpoint string, source string) bool {
 	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
-		h.logger.Info("Health check (%s) failed for %s: %v", source, endpoint, err)
+		h.logger.Debug("Health check (%s) failed for %s: %v", source, endpoint, err)
 		return false
 	}
 
 	resp, err := h.client.Do(req)
 	if err != nil {
-		h.logger.Info("Health check (%s) failed for %s: %v", source, endpoint, err)
+		h.logger.Debug("Health check (%s) failed for %s: %v", source, endpoint, err)
 		return false
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		h.logger.Info("Health check (%s) failed for %s: status %d", source, endpoint, resp.StatusCode)
+		h.logger.Debug("Health check (%s) failed for %s: status %d", source, endpoint, resp.StatusCode)
 		return false
 	}
 
@@ -192,7 +621,7 @@ func (h *HTTPHealthChecker) performCheck(name string, target *TargetState) {
 	isWaking := target.IsWaking
 	target.mu.RUnlock()
 	if isWaking {
-		h.logger.Info("Background health check for %s (%s) running while wake is in progress",
+		h.logger.Debug("Background health check for %s (%s) running while wake is in progress",
 			name, target.Target.Hostname)
 	}
 
@@ -252,9 +681,9 @@ func NewDefaultSSHExecutor(logger Logger) *DefaultSSHExecutor {
 	return &DefaultSSHExecutor{logger: logger}
 }
 
-func (s *DefaultSSHExecutor) ExecuteCommand(host, user, keyPath, command string) error {
+func (s *DefaultSSHExecutor) ExecuteCommand(host, user, keyPath, knownHosts, command string) error {
 	// Read private key
-	key, err := ioutil.ReadFile(keyPath)
+	key, err := os.ReadFile(keyPath)
 	if err != nil {
 		return fmt.Errorf("unable to read private key: %w", err)
 	}
@@ -265,13 +694,24 @@ func (s *DefaultSSHExecutor) ExecuteCommand(host, user, keyPath, command string)
 		return fmt.Errorf("unable to parse private key: %w", err)
 	}
 
+	// Configure host key callback
+	var hostKeyCallback ssh.HostKeyCallback
+	if knownHosts != "" {
+		hostKeyCallback, err = newKnownHostsCallback(knownHosts)
+		if err != nil {
+			return fmt.Errorf("failed to create known_hosts callback: %w", err)
+		}
+	} else {
+		hostKeyCallback = ssh.InsecureIgnoreHostKey()
+	}
+
 	// Configure SSH client
 	config := &ssh.ClientConfig{
 		User: user,
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(signer),
 		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: hostKeyCallback,
 		Timeout:         10 * time.Second,
 	}
 
@@ -298,6 +738,49 @@ func (s *DefaultSSHExecutor) ExecuteCommand(host, user, keyPath, command string)
 
 	s.logger.Info("SSH command executed successfully on %s@%s, output: %s", user, host, string(output))
 	return nil
+}
+
+func newKnownHostsCallback(filename string) (ssh.HostKeyCallback, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("unable to read known_hosts file %s: %w", filename, err)
+	}
+
+	knownHosts := make(map[string]ssh.PublicKey)
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		_, hosts, pubKey, _, _, err := ssh.ParseKnownHosts([]byte(line))
+		if err != nil || pubKey == nil {
+			continue
+		}
+		for _, host := range hosts {
+			knownHosts[host] = pubKey
+		}
+	}
+
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		// Try exact hostname match first
+		if storedKey, ok := knownHosts[hostname]; ok {
+			if bytes.Equal(storedKey.Marshal(), key.Marshal()) {
+				return nil
+			}
+			return fmt.Errorf("host key mismatch for %s", hostname)
+		}
+		// Try wildcard pattern matching (e.g., *.example.com)
+		for pattern, storedKey := range knownHosts {
+			if matched, _ := filepath.Match(pattern, hostname); matched {
+				if bytes.Equal(storedKey.Marshal(), key.Marshal()) {
+					return nil
+				}
+				return fmt.Errorf("host key mismatch for %s (matched pattern %s)", hostname, pattern)
+			}
+		}
+		return fmt.Errorf("no known host key found for %s", hostname)
+	}, nil
 }
 
 func (w *UDPWOLSender) SendWOL(macAddr, broadcastIP string, port int) error {
@@ -327,7 +810,7 @@ func (w *UDPWOLSender) SendWOL(macAddr, broadcastIP string, port int) error {
 		return fmt.Errorf("failed to send WOL packet: %w", err)
 	}
 
-	w.logger.Info("WOL packet sent to %s via %s:%d", macAddr, broadcastIP, port)
+	w.logger.Debug("WOL packet sent to %s via %s:%d", macAddr, broadcastIP, port)
 	return nil
 }
 
@@ -349,11 +832,13 @@ func (w *UDPWOLSender) createMagicPacket(mac net.HardwareAddr) []byte {
 
 // Main proxy service
 type ProxyService struct {
-	config        *ProxyConfig
-	healthChecker HealthChecker
-	wolSender     WOLSender
-	sshExecutor   SSHExecutor
-	logger        Logger
+	config         *ProxyConfig
+	healthChecker  HealthChecker
+	wolSender      WOLSender
+	sshExecutor    SSHExecutor
+	logger         Logger
+	cache          *CacheStore
+	proxyTransport *http.Transport
 }
 
 func NewProxyService(
@@ -362,13 +847,42 @@ func NewProxyService(
 	wolSender WOLSender,
 	sshExecutor SSHExecutor,
 	logger Logger,
+	cache *CacheStore,
 ) *ProxyService {
+	// A single shared transport is reused across all proxied requests (for all
+	// targets - Go's Transport already pools connections per scheme+host, so one
+	// instance is enough). Creating a fresh *http.Transport per request would mean
+	// no keep-alive connection reuse and, since http.Transport has no finalizer
+	// that closes idle connections when garbage collected, a slow leak of open
+	// sockets under sustained traffic.
+	proxyTransport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   60 * time.Second, // Increased timeout for slow connections
+			KeepAlive: 60 * time.Second, // Increased keep-alive
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       120 * time.Second, // Increased idle timeout
+		TLSHandshakeTimeout:   20 * time.Second,  // Increased TLS handshake timeout
+		ExpectContinueTimeout: 5 * time.Second,   // Increased expect-continue timeout
+		MaxIdleConnsPerHost:   10,
+		// Disable compression to avoid issues with already compressed data
+		DisableCompression:    true,
+		ResponseHeaderTimeout: config.ResponseHeaderTimeout,
+		// No timeout for reading the entire response
+		ReadBufferSize:  1024 * 1024, // 1MB buffer for reading
+		WriteBufferSize: 1024 * 1024, // 1MB buffer for writing
+	}
+
 	return &ProxyService{
-		config:        config,
-		healthChecker: healthChecker,
-		wolSender:     wolSender,
-		sshExecutor:   sshExecutor,
-		logger:        logger,
+		config:         config,
+		healthChecker:  healthChecker,
+		wolSender:      wolSender,
+		sshExecutor:    sshExecutor,
+		logger:         logger,
+		cache:          cache,
+		proxyTransport: proxyTransport,
 	}
 }
 
@@ -379,9 +893,9 @@ func (p *ProxyService) shutdownTarget(targetName string) error {
 	}
 
 	target := targetState.Target
-    if (target.SSHHost == "" || target.SSHUser == "" || target.SSHKeyPath == "" || target.ShutdownCommand == "") && target.ShutdownHTTPUrl == "" {
-        return fmt.Errorf("target %s is missing SSH configuration or shutdown command or shutdown HTTP URL", targetName)
-    }
+	if (target.SSHHost == "" || target.SSHUser == "" || target.SSHKeyPath == "" || target.ShutdownCommand == "") && target.ShutdownHTTPUrl == "" {
+		return fmt.Errorf("target %s is missing SSH configuration or shutdown command or shutdown HTTP URL", targetName)
+	}
 
 	p.logger.Info("Shutting down target %s (%s) due to inactivity", targetName, target.Hostname)
 	if target.ShutdownHTTPUrl != "" {
@@ -391,10 +905,10 @@ func (p *ProxyService) shutdownTarget(targetName string) error {
 			method = "POST" // Default to POST if not specified
 		}
 
-        req, err := http.NewRequest(method, target.ShutdownHTTPUrl, nil)
-        if err != nil {
-            return fmt.Errorf("failed to create shutdown request: %w", err)
-        }
+		req, err := http.NewRequest(method, target.ShutdownHTTPUrl, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create shutdown request: %w", err)
+		}
 
 		// Send the request
 		client := &http.Client{
@@ -406,17 +920,17 @@ func (p *ProxyService) shutdownTarget(targetName string) error {
 		}
 		defer resp.Body.Close()
 
-        // Accept any 2xx status by default; allow explicit status override
-        if target.ShutdownHTTPOKStatus != 0 {
-            if resp.StatusCode != target.ShutdownHTTPOKStatus {
-                return fmt.Errorf("shutdown request failed with status: %s", resp.Status)
-            }
-        } else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-            return fmt.Errorf("shutdown request failed with status: %s", resp.Status)
-        }
+		// Accept any 2xx status by default; allow explicit status override
+		if target.ShutdownHTTPOKStatus != 0 {
+			if resp.StatusCode != target.ShutdownHTTPOKStatus {
+				return fmt.Errorf("shutdown request failed with status: %s", resp.Status)
+			}
+		} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return fmt.Errorf("shutdown request failed with status: %s", resp.Status)
+		}
 
 	} else {
-		err := p.sshExecutor.ExecuteCommand(target.SSHHost, target.SSHUser, target.SSHKeyPath, target.ShutdownCommand)
+		err := p.sshExecutor.ExecuteCommand(target.SSHHost, target.SSHUser, target.SSHKeyPath, target.SSHKnownHosts, target.ShutdownCommand)
 		if err != nil {
 			p.logger.Error("Failed to shut down target %s: %v", targetName, err)
 			return err
@@ -428,6 +942,7 @@ func (p *ProxyService) shutdownTarget(targetName string) error {
 	targetState.IsHealthy = false
 	targetState.mu.Unlock()
 	p.healthChecker.CloseIdleConnections()
+	p.proxyTransport.CloseIdleConnections()
 
 	p.logger.Info("Target %s (%s) has been shut down", targetName, target.Hostname)
 	return nil
@@ -481,6 +996,51 @@ func (p *ProxyService) checkInactiveTargets() {
 	}
 }
 
+func (p *ProxyService) startCacheCleanup(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.cache.Cleanup()
+		}
+	}
+}
+
+func (p *ProxyService) startCacheWarming(ctx context.Context) {
+	ticker := time.NewTicker(p.config.CacheWarmInterval)
+	defer ticker.Stop()
+
+	for _, targetState := range p.config.Targets {
+		targetState.mu.RLock()
+		isHealthy := targetState.IsHealthy
+		targetState.mu.RUnlock()
+		if isHealthy {
+			p.warmCache(targetState.Target.Name)
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, targetState := range p.config.Targets {
+				targetState.mu.RLock()
+				isHealthy := targetState.IsHealthy
+				targetState.mu.RUnlock()
+
+				if isHealthy {
+					p.warmCache(targetState.Target.Name)
+				}
+			}
+		}
+	}
+}
+
 func isSecureServer(config *ProxyConfig) bool {
 	return config.SSLCertificate != "" && config.SSLCertificateKey != ""
 }
@@ -501,6 +1061,15 @@ func (p *ProxyService) Start(ctx context.Context) error {
 
 	// Start background inactivity monitor
 	go p.startInactivityMonitor(ctx)
+
+	// Start cache background tasks if cache is enabled
+	if p.cache != nil && p.config.CacheEnabled {
+		p.logger.Info("Cache enabled, root path: %s, TTL: %v, warm interval: %v",
+			p.config.CacheRootPath, p.config.CacheTTL, p.config.CacheWarmInterval)
+
+		go p.startCacheCleanup(ctx)
+		go p.startCacheWarming(ctx)
+	}
 
 	p.logger.Info("Initial health checks completed, starting HTTP server")
 
@@ -538,11 +1107,50 @@ func (p *ProxyService) Start(ctx context.Context) error {
 		server.TLSConfig = tlsConfig
 
 		p.logger.Info("HTTPS server listening on %s with SSL certificates", p.config.Port)
-		//The files in these methods are ignored since there is already a certificate in the config.
-		return server.ListenAndServeTLS("", "")
+		return p.serveAndWaitForShutdown(ctx, server, func() error {
+			//The files in these methods are ignored since there is already a certificate in the config.
+			return server.ListenAndServeTLS("", "")
+		})
 	} else {
 		p.logger.Info("HTTP server listening on %s", p.config.Port)
-		return server.ListenAndServe()
+		return p.serveAndWaitForShutdown(ctx, server, server.ListenAndServe)
+	}
+}
+
+// serveAndWaitForShutdown runs the HTTP(S) server in the background and blocks until
+// either the server stops on its own (returning its error, if any) or ctx is
+// cancelled (e.g. via SIGINT/SIGTERM), in which case the server is shut down
+// gracefully with a bounded timeout.
+func (p *ProxyService) serveAndWaitForShutdown(ctx context.Context, server *http.Server, serve func() error) error {
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- serve()
+	}()
+
+	select {
+	case err := <-serverErr:
+		if err != nil && err != http.ErrServerClosed {
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		p.logger.Info("Shutdown signal received, stopping server gracefully...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			p.logger.Error("Error during server shutdown: %v", err)
+			return err
+		}
+
+		if p.cache != nil {
+			p.cache.Close()
+		}
+		p.proxyTransport.CloseIdleConnections()
+		p.healthChecker.CloseIdleConnections()
+
+		p.logger.Info("Server stopped gracefully")
+		return nil
 	}
 }
 
@@ -555,8 +1163,8 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.logger.Info("Incoming request for hostname: %s -> target: %s, path: %s",
-		r.Host, targetName, r.URL.Path)
+	p.logger.Info("Incoming request for hostname: %s -> target: %s, path: %s (client: %s)",
+		r.Host, targetName, r.URL.Path, r.RemoteAddr)
 
 	targetState, exists := p.config.Targets[targetName]
 	if !exists {
@@ -566,17 +1174,36 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check if we have fresh health data
-	cached, reason := p.healthCacheStatus(targetState)
+	cached, reason := p.healthCacheStatus(r.Context(), targetName, targetState)
 	if cached {
 		p.logger.Info("Target %s is healthy, proxying immediately", targetName)
 		p.proxyRequest(w, r, targetState.Target)
 		return
 	}
 
+	// Check static cache before triggering WOL
+	if p.cache != nil && p.config.CacheEnabled {
+		if r.Method == "GET" {
+			if resp, ok := p.cache.Get(targetName, r.URL.Path); ok {
+				p.logger.Info("Serving cached response for %s %s (target %s is down)",
+					r.Method, r.URL.Path, targetName)
+				for k, v := range resp.Header {
+					for _, header := range v {
+						w.Header().Add(k, header)
+					}
+				}
+				w.WriteHeader(resp.StatusCode)
+				io.Copy(w, resp.Body)
+				resp.Body.Close()
+				return
+			}
+		}
+	}
+
 	// Need to wake up the server
 	p.logger.Info("Target %s appears down (%s), attempting to wake", targetName, reason)
 	p.healthChecker.CloseIdleConnections()
-	if err := p.wakeAndWait(r.Context(), targetState); err != nil {
+	if _, err := p.wakeAndWait(r.Context(), targetState); err != nil {
 		p.logger.Error("Failed to wake target %s: %v", targetName, err)
 		http.Error(w, "Service temporarily unavailable", http.StatusServiceUnavailable)
 		return
@@ -601,121 +1228,360 @@ func (p *ProxyService) extractTarget(r *http.Request) string {
 	return ""
 }
 
-func (p *ProxyService) healthCacheStatus(target *TargetState) (cached bool, reason string) {
+// healthCacheStatus reports whether the target can be treated as healthy
+// right now. If the last background check marked it healthy but that check
+// has aged past health_cache_duration, we don't immediately assume it's
+// down - background checks only run every health_check_interval, so if
+// health_check_interval > health_cache_duration there would otherwise be a
+// recurring window (between the two durations) where a perfectly healthy
+// target is wrongly treated as down and a WOL burst is fired for no reason.
+// Instead we perform a quick synchronous re-check here before giving up.
+func (p *ProxyService) healthCacheStatus(ctx context.Context, targetName string, target *TargetState) (cached bool, reason string) {
 	target.mu.RLock()
-	defer target.mu.RUnlock()
+	wasHealthy := target.IsHealthy
+	lastCheck := target.LastCheck
+	target.mu.RUnlock()
 
-	if !target.IsHealthy {
-		if target.LastCheck.IsZero() {
+	if !wasHealthy {
+		if lastCheck.IsZero() {
 			return false, "no prior health check"
 		}
 		return false, fmt.Sprintf(
 			"marked unhealthy (last check %v ago)",
-			time.Since(target.LastCheck).Round(time.Second),
+			time.Since(lastCheck).Round(time.Second),
 		)
 	}
 
-	age := time.Since(target.LastCheck)
-	if age > p.config.HealthCacheDuration {
-		return false, fmt.Sprintf(
-			"cached health expired (last check %v ago, cache duration %v)",
-			age.Round(time.Second), p.config.HealthCacheDuration,
-		)
+	age := time.Since(lastCheck)
+	if age <= p.config.HealthCacheDuration {
+		return true, ""
 	}
 
-	return true, ""
-}
+	// Cached health is stale but the target was healthy as of the last
+	// check. Do an on-demand check (short timeout) instead of assuming down.
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 
-func (p *ProxyService) wakeAndWait(ctx context.Context, target *TargetState) error {
+	healthy := p.healthChecker.Check(checkCtx, target.Target.HealthEndpoint, "on-demand")
+
 	target.mu.Lock()
-	if target.IsWaking {
-		target.mu.Unlock()
-		p.logger.Info("Target %s (%s) wake already in progress, joining existing wait",
-			target.Target.Name, target.Target.Hostname)
-		return p.waitForWake(ctx, target)
-	}
-
-	target.IsWaking = true
+	target.IsHealthy = healthy
+	target.LastCheck = time.Now()
 	target.mu.Unlock()
 
-	err := p.wolSender.SendWOL(
+	if healthy {
+		p.logger.Debug("On-demand health re-check for %s succeeded (stale cache: last check %v ago)",
+			targetName, age.Round(time.Second))
+		return true, ""
+	}
+
+	p.logger.Info("On-demand health re-check for %s failed (last background check %v ago)",
+		targetName, age.Round(time.Second))
+	return false, fmt.Sprintf(
+		"on-demand health check failed (last background check %v ago, cache duration %v)",
+		age.Round(time.Second), p.config.HealthCacheDuration,
+	)
+}
+
+func (p *ProxyService) wakeAndWait(ctx context.Context, target *TargetState) (int, error) {
+	target.mu.Lock()
+	if target.IsWaking {
+		gen := target.wakeGen
+		done := target.wakeDone
+		target.mu.Unlock()
+		p.logger.Info("Target %s (%s) wake already in progress, joining existing wait (gen=%d)",
+			target.Target.Name, target.Target.Hostname, gen)
+		return gen, p.joinWake(ctx, target, gen, done)
+	}
+
+	target.wakeGen++
+	gen := target.wakeGen
+	target.IsWaking = true
+	target.LastActivity = time.Now()
+	done := make(chan struct{})
+	target.wakeDone = done
+	target.mu.Unlock()
+
+	if err := p.wolSender.SendWOL(
 		target.Target.MacAddress,
 		target.Target.BroadcastIP,
 		target.Target.WolPort,
-	)
-
-	target.mu.Lock()
-	target.LastActivity = time.Now()
-	target.IsWaking = false
-	target.mu.Unlock()
-
-	if err != nil {
-		return fmt.Errorf("failed to send WOL: %w", err)
+	); err != nil {
+		wrapped := fmt.Errorf("failed to send WOL: %w", err)
+		target.mu.Lock()
+		target.IsWaking = false
+		target.wakeErr = wrapped
+		close(done)
+		target.mu.Unlock()
+		return 0, wrapped
 	}
 
-	p.logger.Info("WOL packet sent to %s (%s), waiting for server to wake",
-		target.Target.Name, target.Target.Hostname)
+	p.logger.Info("WOL packet sent to %s (%s), waiting for server to wake (gen=%d)",
+		target.Target.Name, target.Target.Hostname, gen)
 
-	return p.waitForWake(ctx, target)
+	err := p.waitForWake(ctx, target, gen)
+
+	// waitForWake already resets IsWaking on every return path; here we just
+	// record the outcome and release anyone who joined this wake generation.
+	target.mu.Lock()
+	target.wakeErr = err
+	close(done)
+	target.mu.Unlock()
+
+	return gen, err
 }
 
-func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState) error {
+// joinWake is used by requests that arrive while another goroutine is already
+// waking the target for the same generation. Previously, joining requests
+// independently re-ran the full WOL burst + health-poll loop, so N concurrent
+// requests produced N-fold WOL packets and N-fold health checks against the
+// target (visible in the logs as repeated "Sent WOL burst packet x/3" and
+// "Cache invalidated" lines at the same timestamp). Instead, a joiner now
+// just waits for the in-flight wake to finish and reuses its result.
+func (p *ProxyService) joinWake(ctx context.Context, target *TargetState, gen int, done chan struct{}) error {
+	if done == nil {
+		return fmt.Errorf("no in-flight wake to join for %s", target.Target.Name)
+	}
+
+	select {
+	case <-done:
+		target.mu.RLock()
+		err := target.wakeErr
+		healthy := target.IsHealthy
+		currentGen := target.wakeGen
+		target.mu.RUnlock()
+
+		if currentGen != gen {
+			return fmt.Errorf("wake aborted: generation changed (was %d, now %d)", gen, currentGen)
+		}
+		if healthy {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("wake failed for %s", target.Target.Name)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// waitForWake repeatedly sends a burst of WOL packets and waits for the
+// target to come up. Each cycle is strictly: send a burst of burstCount
+// packets 500ms apart, THEN wait the full waitDuration (starting at
+// startup_time, halved on each retry down to a 500ms floor), and only THEN
+// perform a single health check. Checking health immediately after a burst
+// is pointless - the machine hasn't had time to boot - so no check happens
+// until the full wait has elapsed.
+func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState, wakeGen int) error {
 	timeout := time.After(p.config.Timeout)
-	healthCheckTicker := time.NewTicker(p.config.PollInterval)
-	defer healthCheckTicker.Stop()
-
-	// Create a separate ticker for sending WOL packets
-	// Send a packet once per second
-	wolTicker := time.NewTicker(500 * time.Millisecond)
-	defer wolTicker.Stop()
-
 	wakeStartTime := time.Now()
-	p.logger.Info("Waiting for %s (%s) to wake (poll interval %v, timeout %v)",
-		target.Target.Name, target.Target.Hostname, p.config.PollInterval, p.config.Timeout)
+	waitDuration := p.config.StartupTime
+	burstCount := 3
+	if target.Target.WOLBurstCount > 0 {
+		if target.Target.WOLBurstCount < 1 {
+			burstCount = 1
+		} else if target.Target.WOLBurstCount > 10 {
+			burstCount = 10
+		} else {
+			burstCount = target.Target.WOLBurstCount
+		}
+	}
+	burstInterval := 500 * time.Millisecond
 
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timeout:
-			target.mu.Lock()
+	giveUp := func(err error) error {
+		target.mu.Lock()
+		if target.wakeGen == wakeGen {
 			target.IsWaking = false
-			target.mu.Unlock()
-			return fmt.Errorf("timeout waiting for %s to wake up after %v",
-				target.Target.Name, p.config.Timeout)
-		case <-wolTicker.C:
-			// Send additional WOL packets while waiting
-			err := p.wolSender.SendWOL(
+		}
+		target.mu.Unlock()
+		return err
+	}
+
+	// sendWOLBurst sends burstCount WOL packets burstInterval apart. It
+	// returns early (with ctx.Err()) if the context is cancelled mid-burst.
+	sendWOLBurst := func() error {
+		for i := 0; i < burstCount; i++ {
+			if err := p.wolSender.SendWOL(
 				target.Target.MacAddress,
 				target.Target.BroadcastIP,
 				target.Target.WolPort,
-			)
-			if err != nil {
-				p.logger.Error("Failed to send additional WOL packet: %v", err)
-				// Continue waiting even if a packet fails to send
+			); err != nil {
+				p.logger.Error("Failed to send WOL packet during burst: %v", err)
 			} else {
-				p.logger.Info("Sent additional WOL packet to %s (%s)",
-					target.Target.Name, target.Target.Hostname)
+				p.logger.Info("Sent WOL burst packet %d/%d to %s (%s)",
+					i+1, burstCount, target.Target.Name, target.Target.Hostname)
 			}
-		case <-healthCheckTicker.C:
-			if p.healthChecker.Check(ctx, target.Target.HealthEndpoint, "wake") {
-				target.mu.Lock()
-				target.IsHealthy = true
-				target.LastCheck = time.Now()
-				target.IsWaking = false
-				target.mu.Unlock()
-
-				wakeDuration := time.Since(wakeStartTime)
-				p.logger.Info("Target %s (%s) woke up after %v",
-					target.Target.Name, target.Target.Hostname, wakeDuration)
-				return nil
+			if i < burstCount-1 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-timeout:
+					return fmt.Errorf("timeout waiting for %s to wake up after %v",
+						target.Target.Name, p.config.Timeout)
+				case <-time.After(burstInterval):
+				}
 			}
 		}
-
-		target.mu.Lock()
-		target.IsWaking = false
-		target.mu.Unlock()
+		return nil
 	}
+
+	for {
+		target.mu.RLock()
+		currentGen := target.wakeGen
+		target.mu.RUnlock()
+
+		if currentGen != wakeGen {
+			p.logger.Info("Wake generation changed (old=%d, new=%d), abandoning wait for %s",
+				wakeGen, currentGen, target.Target.Name)
+			return giveUp(fmt.Errorf("wake aborted: generation changed (was %d, now %d)", wakeGen, currentGen))
+		}
+
+		if err := sendWOLBurst(); err != nil {
+			return giveUp(err)
+		}
+
+		select {
+		case <-ctx.Done():
+			return giveUp(ctx.Err())
+		case <-timeout:
+			return giveUp(fmt.Errorf("timeout waiting for %s to wake up after %v",
+				target.Target.Name, p.config.Timeout))
+		case <-time.After(waitDuration):
+		}
+
+		if p.healthChecker.Check(ctx, target.Target.HealthEndpoint, "wake") {
+			target.mu.Lock()
+			target.IsHealthy = true
+			target.LastCheck = time.Now()
+			target.IsWaking = false
+			target.mu.Unlock()
+
+			wakeDuration := time.Since(wakeStartTime)
+			p.logger.Info("Target %s (%s) woke up after %v (gen=%d)",
+				target.Target.Name, target.Target.Hostname, wakeDuration, wakeGen)
+
+			if p.cache != nil && p.config.CacheEnabled {
+				p.cache.InvalidateTarget(target.Target.Name)
+			}
+
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return giveUp(ctx.Err())
+		case <-timeout:
+			return giveUp(fmt.Errorf("timeout waiting for %s to wake up after %v",
+				target.Target.Name, p.config.Timeout))
+		default:
+			waitDuration = waitDuration / 2
+			if waitDuration < 500*time.Millisecond {
+				waitDuration = 500 * time.Millisecond
+			}
+		}
+	}
+}
+
+type catchingBody struct {
+	io.Reader
+	original io.ReadCloser
+	onDone   func()
+	closed   bool
+}
+
+func (cb *catchingBody) Close() error {
+	if cb.closed {
+		return nil
+	}
+	cb.closed = true
+
+	if cb.onDone != nil {
+		cb.onDone()
+	}
+	if cb.original != nil {
+		return cb.original.Close()
+	}
+	return nil
+}
+
+func (p *ProxyService) warmCache(targetName string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	p.logger.Debug("Starting cache warmup for target: %s", targetName)
+
+	cachedPaths := p.cache.GetCachedPathsForTarget(targetName)
+	if len(cachedPaths) == 0 {
+		p.logger.Debug("No cached paths to warm for target: %s", targetName)
+		return
+	}
+
+	targetState, exists := p.config.Targets[targetName]
+	if !exists {
+		return
+	}
+
+	target := targetState.Target
+	targetURL, err := url.Parse(target.Destination)
+	if err != nil {
+		return
+	}
+
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+				DualStack: true,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          10,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			DisableCompression:    true,
+		},
+	}
+
+	for _, path := range cachedPaths {
+		select {
+		case <-ctx.Done():
+			p.logger.Debug("Cache warmup cancelled for target: %s", targetName)
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+
+		reqURL := *targetURL
+		reqURL.Path = path
+
+		req, err := http.NewRequestWithContext(ctx, "GET", reqURL.String(), nil)
+		if err != nil {
+			p.logger.Error("Failed to create request for %s %s: %v", targetName, path, err)
+			continue
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			p.logger.Error("Failed to warm cache for %s %s: %v", targetName, path, err)
+			continue
+		}
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			body, err := io.ReadAll(io.LimitReader(resp.Body, p.config.CacheMaxResponseSize))
+			resp.Body.Close()
+
+			if err == nil {
+				p.cache.Save(targetName, path, resp.StatusCode, resp.Header, body)
+			}
+		} else {
+			resp.Body.Close()
+		}
+	}
+
+	p.logger.Debug("Cache warmup completed for target: %s", targetName)
 }
 
 func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, target *Target) {
@@ -733,28 +1599,7 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, targ
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-
-	// Create a custom transport with optimized settings for large uploads
-	proxy.Transport = &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   60 * time.Second, // Increased timeout for slow connections
-			KeepAlive: 60 * time.Second, // Increased keep-alive
-			DualStack: true,
-		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       120 * time.Second, // Increased idle timeout
-		TLSHandshakeTimeout:   20 * time.Second,  // Increased TLS handshake timeout
-		ExpectContinueTimeout: 5 * time.Second,   // Increased expect-continue timeout
-		MaxIdleConnsPerHost:   10,
-		// Disable compression to avoid issues with already compressed data
-		DisableCompression: true,
-		ResponseHeaderTimeout: p.config.ResponseHeaderTimeout,
-		// No timeout for reading the entire response
-		ReadBufferSize:  1024 * 1024, // 1MB buffer for reading
-		WriteBufferSize: 1024 * 1024, // 1MB buffer for writing
-	}
+	proxy.Transport = p.proxyTransport
 
 	// Customize the proxy to handle errors and logging
 	originalDirector := proxy.Director
@@ -785,6 +1630,41 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, targ
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		p.logger.Info("Response from %s: status=%d, content-length=%d",
 			target.Name, resp.StatusCode, resp.ContentLength)
+
+		if p.cache != nil && p.config.CacheEnabled && r.Method == "GET" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			cachePaths, exists := p.config.CachePaths[target.Name]
+			if exists {
+				var shouldCache bool
+				for _, pattern := range cachePaths {
+					if strings.HasSuffix(pattern, "/*") {
+						prefix := strings.TrimSuffix(pattern, "/*")
+						if strings.HasPrefix(r.URL.Path, prefix) {
+							shouldCache = true
+							break
+						}
+					} else if r.URL.Path == pattern {
+						shouldCache = true
+						break
+					}
+				}
+
+				if shouldCache {
+					buf := &bytes.Buffer{}
+					tee := io.TeeReader(resp.Body, buf)
+					resp.Body = &catchingBody{
+						Reader:   tee,
+						original: resp.Body,
+						onDone: func() {
+							body := buf.Bytes()
+							if int64(len(body)) <= p.config.CacheMaxResponseSize {
+								p.cache.Save(target.Name, r.URL.Path, resp.StatusCode, resp.Header, body)
+							}
+						},
+					}
+				}
+			}
+		}
+
 		return nil
 	}
 
@@ -816,17 +1696,23 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		return nil, fmt.Errorf("invalid timeout: %w", err)
 	}
 
+	startupTime := 30 * time.Second
+	if config.StartupTime != "" {
+		startupTime, err = time.ParseDuration(config.StartupTime)
+		if err != nil {
+			return nil, fmt.Errorf("invalid startup_time: %w", err)
+		}
+	}
+	if startupTime >= timeout {
+		return nil, fmt.Errorf("startup_time (%v) must be less than timeout (%v)", startupTime, timeout)
+	}
+
 	if config.ResponseHeaderTimeout == "" {
 		config.ResponseHeaderTimeout = "1m"
 	}
 	responseHeaderTimeout, err := time.ParseDuration(config.ResponseHeaderTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("invalid response_header_timeout: %w", err)
-	}
-
-	pollInterval, err := time.ParseDuration(config.PollInterval)
-	if err != nil {
-		return nil, fmt.Errorf("invalid poll_interval: %w", err)
 	}
 
 	healthCheckInterval, err := time.ParseDuration(config.HealthCheckInterval)
@@ -839,14 +1725,56 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		return nil, fmt.Errorf("invalid health_cache_duration: %w", err)
 	}
 
+	var cacheEnabled bool
+	var cacheRootPath string
+	var cacheTTL time.Duration
+	var cacheMaxResponseSize int64
+	var cacheWarmInterval time.Duration
+	cachePaths := make(map[string][]string)
+
+	if config.CacheConfig.Enabled {
+		cacheEnabled = true
+		cacheRootPath = config.CacheConfig.RootPath
+		if cacheRootPath == "" {
+			cacheRootPath = "./cache"
+		}
+
+		cacheTTL = 24 * time.Hour
+		if config.CacheConfig.TTL != "" {
+			cacheTTL, err = time.ParseDuration(config.CacheConfig.TTL)
+			if err != nil {
+				return nil, fmt.Errorf("invalid cache ttl: %w", err)
+			}
+		}
+
+		cacheMaxResponseSize = 10 * 1024 * 1024
+		if config.CacheConfig.MaxResponseSizeBytes > 0 {
+			cacheMaxResponseSize = config.CacheConfig.MaxResponseSizeBytes
+		}
+
+		cacheWarmInterval = 30 * time.Minute
+		if config.CacheConfig.WarmInterval != "" {
+			cacheWarmInterval, err = time.ParseDuration(config.CacheConfig.WarmInterval)
+			if err != nil {
+				return nil, fmt.Errorf("invalid cache warm_interval: %w", err)
+			}
+		}
+
+		for _, ct := range config.CacheConfig.Targets {
+			if ct.Target != "" && len(ct.Paths) > 0 {
+				cachePaths[ct.Target] = ct.Paths
+			}
+		}
+	}
+
 	targets := make(map[string]*TargetState)
 	hostnameMap := make(map[string]string)
 	inactivityThresholds := make(map[string]time.Duration)
 
-    for _, target := range config.Targets {
-        if target.Hostname == "" {
-            return nil, fmt.Errorf("target %s is missing hostname", target.Name)
-        }
+	for _, target := range config.Targets {
+		if target.Hostname == "" {
+			return nil, fmt.Errorf("target %s is missing hostname", target.Name)
+		}
 
 		// Check for duplicate hostnames
 		if existingTarget, exists := hostnameMap[target.Hostname]; exists {
@@ -854,23 +1782,43 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 				target.Hostname, existingTarget, target.Name)
 		}
 
-        // Validate shutdown configuration
-        // Disallow using both SSH shutdown command and HTTP shutdown URL
-        if strings.TrimSpace(target.ShutdownHTTPUrl) != "" && strings.TrimSpace(target.ShutdownCommand) != "" {
-            return nil, fmt.Errorf("target %s: cannot define both shutdown_http_url and shutdown_command; choose one", target.Name)
-        }
+		// Validate WOL configuration
+		if target.MacAddress == "" {
+			return nil, fmt.Errorf("target %s is missing mac_address", target.Name)
+		}
+		if target.BroadcastIP == "" {
+			return nil, fmt.Errorf("target %s is missing broadcast_ip", target.Name)
+		}
+		if _, err := net.ParseMAC(target.MacAddress); err != nil {
+			return nil, fmt.Errorf("target %s has invalid mac_address %q: %w", target.Name, target.MacAddress, err)
+		}
+		if _, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:0", target.BroadcastIP)); err != nil {
+			return nil, fmt.Errorf("target %s has invalid broadcast_ip %q: %w", target.Name, target.BroadcastIP, err)
+		}
+		if target.WolPort != 0 && (target.WolPort < 1 || target.WolPort > 65535) {
+			return nil, fmt.Errorf("target %s has invalid wol_port %d (must be 1-65535 or 0 for default)", target.Name, target.WolPort)
+		}
+		if target.WolPort == 0 {
+			target.WolPort = 9 // standard Wake-on-LAN port
+		}
 
-        // Disallow http method/ok status without URL
-        if strings.TrimSpace(target.ShutdownHTTPUrl) == "" && (strings.TrimSpace(target.ShutdownHTTPMethod) != "" || target.ShutdownHTTPOKStatus != 0) {
-            return nil, fmt.Errorf("target %s: shutdown_http_method and/or shutdown_http_ok_status require shutdown_http_url to be set", target.Name)
-        }
+		// Validate shutdown configuration
+		// Disallow using both SSH shutdown command and HTTP shutdown URL
+		if strings.TrimSpace(target.ShutdownHTTPUrl) != "" && strings.TrimSpace(target.ShutdownCommand) != "" {
+			return nil, fmt.Errorf("target %s: cannot define both shutdown_http_url and shutdown_command; choose one", target.Name)
+		}
 
-        // Parse inactivity threshold if provided
-        if target.InactivityThreshold != "" {
-            inactivityThreshold, err := time.ParseDuration(target.InactivityThreshold)
-            if err != nil {
-                return nil, fmt.Errorf("invalid inactivity_threshold for target %s: %w", target.Name, err)
-            }
+		// Disallow http method/ok status without URL
+		if strings.TrimSpace(target.ShutdownHTTPUrl) == "" && (strings.TrimSpace(target.ShutdownHTTPMethod) != "" || target.ShutdownHTTPOKStatus != 0) {
+			return nil, fmt.Errorf("target %s: shutdown_http_method and/or shutdown_http_ok_status require shutdown_http_url to be set", target.Name)
+		}
+
+		// Parse inactivity threshold if provided
+		if target.InactivityThreshold != "" {
+			inactivityThreshold, err := time.ParseDuration(target.InactivityThreshold)
+			if err != nil {
+				return nil, fmt.Errorf("invalid inactivity_threshold for target %s: %w", target.Name, err)
+			}
 			inactivityThresholds[target.Name] = inactivityThreshold
 		}
 
@@ -887,25 +1835,49 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		SSLCertificate:        config.SSLCertificate,
 		SSLCertificateKey:     config.SSLCertificateKey,
 		Timeout:               timeout,
+		StartupTime:           startupTime,
 		ResponseHeaderTimeout: responseHeaderTimeout,
-		PollInterval:          pollInterval,
 		HealthCheckInterval:   healthCheckInterval,
 		HealthCacheDuration:   healthCacheDuration,
+		LogLevel:              config.LogLevel,
 		Targets:               targets,
 		HostnameMap:           hostnameMap,
 		InactivityThresholds:  inactivityThresholds,
+		CacheEnabled:          cacheEnabled,
+		CacheRootPath:         cacheRootPath,
+		CacheTTL:              cacheTTL,
+		CacheMaxResponseSize:  cacheMaxResponseSize,
+		CacheWarmInterval:     cacheWarmInterval,
+		CachePaths:            cachePaths,
 	}, nil
 }
 
 // Simple logger implementation
-type StdLogger struct{}
+type StdLogger struct {
+	level    LogLevel
+	location *time.Location
+}
+
+func (l *StdLogger) shouldLog(level LogLevel) bool {
+	return l.level <= level
+}
 
 func (l *StdLogger) Info(msg string, args ...interface{}) {
-	log.Printf("[INFO] "+msg, args...)
+	if l.shouldLog(LogLevelInfo) {
+		log.Printf("[INFO] %s "+msg, append([]interface{}{time.Now().In(l.location).Format("2006-01-02 15:04:05")}, args...)...)
+	}
 }
 
 func (l *StdLogger) Error(msg string, args ...interface{}) {
-	log.Printf("[ERROR] "+msg, args...)
+	if l.shouldLog(LogLevelError) {
+		log.Printf("[ERROR] %s "+msg, append([]interface{}{time.Now().In(l.location).Format("2006-01-02 15:04:05")}, args...)...)
+	}
+}
+
+func (l *StdLogger) Debug(msg string, args ...interface{}) {
+	if l.shouldLog(LogLevelDebug) {
+		log.Printf("[DEBUG] %s "+msg, append([]interface{}{time.Now().In(l.location).Format("2006-01-02 15:04:05")}, args...)...)
+	}
 }
 
 // Main function
@@ -923,16 +1895,45 @@ func main() {
 	}
 
 	// Initialize dependencies
-	logger := &StdLogger{}
+	tz := os.Getenv("TZ")
+	if tz == "" {
+		tz = "UTC"
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		log.Printf("Invalid timezone %q, defaulting to UTC: %v", tz, err)
+		tz = "UTC"
+		loc = time.UTC
+	}
+	logger := &StdLogger{level: ParseLogLevel(config.LogLevel), location: loc}
 	healthChecker := NewHTTPHealthChecker(logger)
 	wolSender := NewUDPWOLSender(logger)
 	sshExecutor := NewDefaultSSHExecutor(logger)
 
-	// Create proxy service
-	proxy := NewProxyService(config, healthChecker, wolSender, sshExecutor, logger)
+	var cache *CacheStore
+	if config.CacheEnabled {
+		cache = NewCacheStore(config.CacheRootPath, config.CacheTTL, config.CacheMaxResponseSize, config.CachePaths, logger)
+	}
 
-	// Start the service
-	ctx := context.Background()
+	// Create proxy service
+	proxy := NewProxyService(config, healthChecker, wolSender, sshExecutor, logger, cache)
+
+	// Start the service with graceful shutdown on SIGINT/SIGTERM
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+		select {
+		case sig := <-sigChan:
+			log.Printf("Received signal %v, initiating graceful shutdown", sig)
+		case <-ctx.Done():
+			return
+		}
+		cancel()
+	}()
+
 	if err := proxy.Start(ctx); err != nil {
 		log.Fatalf("Failed to start proxy: %v", err)
 	}

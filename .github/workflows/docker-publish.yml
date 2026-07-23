@@ -2,12 +2,7 @@ name: Docker Build and Publish
 
 on:
   push:
-    branches: [ main ]
-    paths:
-      - '**/*.go'
-      - 'go.mod'
-      - 'go.sum'
-      - 'Dockerfile'
+    branches: [ main, develop ]
 
 env:
   REGISTRY: ghcr.io
@@ -45,7 +40,7 @@ jobs:
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            latest
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v4
