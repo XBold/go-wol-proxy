@@ -162,10 +162,12 @@ When enabled, the proxy caches HTTP responses for configured paths to disk. This
 
 ### How It Works
 
-1. **Caching**: Successful GET responses to configured paths are saved to disk
+1. **Caching**: Successful GET responses to configured paths are saved to disk (one single-file entry per path, written atomically)
 2. **Serving**: When a destination is down and a cached response exists for the requested path, it's served immediately
-3. **Invalidation**: Cache is cleared when a target wakes up (ensures fresh content after wake)
-4. **Warming**: After invalidation, the proxy fetches all configured paths to rebuild the cache
+3. **Post-wake refresh**: When a target wakes up, the proxy re-fetches all configured paths and updates the cached entries in place; if a refresh fails, the previous entries stay servable
+4. **Warming**: Healthy targets are re-fetched periodically (`warm_interval`)
+
+Wake-on-LAN is not tied to any single client request: the wake completes in the background even if every waiting client times out, and the cached entries are refreshed as soon as the machine is back.
 
 ### Configuration
 

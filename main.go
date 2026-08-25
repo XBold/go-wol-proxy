@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -239,21 +240,24 @@ func (cs *CacheStore) load(targetName, path string) (*cacheEntry, bool) {
 	}
 
 	var entry cacheEntry
-	metaFile := cacheFile + ".meta"
-	metaData, err := os.ReadFile(metaFile)
-	if err != nil {
-		return nil, false
+	if meta, body, ok := parseCacheEnvelope(data); ok && meta.Path == path {
+		entry = meta
+		entry.Body = body
+	} else {
+		// Legacy two-file layout: body in cacheFile, metadata in cacheFile+".meta"
+		metaData, err := os.ReadFile(cacheFile + ".meta")
+		if err != nil {
+			return nil, false
+		}
+		if err := json.Unmarshal(metaData, &entry); err != nil {
+			return nil, false
+		}
+		entry.Body = data
 	}
-
-	if err := json.Unmarshal(metaData, &entry); err != nil {
-		return nil, false
-	}
-
-	entry.Body = data
 
 	if time.Since(entry.Timestamp) > cs.ttl {
 		os.Remove(cacheFile)
-		os.Remove(metaFile)
+		os.Remove(cacheFile + ".meta")
 		return nil, false
 	}
 
@@ -282,11 +286,18 @@ func (cs *CacheStore) Save(targetName, path string, statusCode int, headers http
 	}
 
 	bodyHash := sha256.Sum256(body)
+	cacheFile := cs.cacheFilePath(targetName, path)
 
 	cs.entriesMu.Lock()
 	k := cs.key(targetName, path)
-	if lastHash, exists := cs.lastHashes[k]; exists {
-		if bytes.Equal(lastHash, bodyHash[:]) {
+	if lastHash, exists := cs.lastHashes[k]; exists && bytes.Equal(lastHash, bodyHash[:]) {
+		// Unchanged content only allows skipping the write while the cache
+		// file is still on disk: the file can disappear independently of
+		// lastHashes (TTL expiry in load, manual cleanup, ...). Skipping the
+		// write in that case would leave the cache empty forever for
+		// unchanged responses (e.g. a static model list), sending WOL on
+		// every offline request.
+		if _, err := os.Stat(cacheFile); err == nil {
 			cs.entriesMu.Unlock()
 			cs.logger.Debug("Cache unchanged for %s %s, skipping write", targetName, path)
 			return
@@ -300,32 +311,40 @@ func (cs *CacheStore) Save(targetName, path string, statusCode int, headers http
 		return
 	}
 
-	cacheFile := cs.cacheFilePath(targetName, path)
-	metaFile := cacheFile + ".meta"
-
 	meta := &cacheEntry{
 		StatusCode: statusCode,
-		Headers:    headers,
+		Headers:    sanitizeCachedHeaders(headers),
 		Body:       body,
 		Timestamp:  time.Now(),
 		Path:       path,
 	}
 
-	if err := os.WriteFile(cacheFile, body, 0644); err != nil {
-		cs.logger.Error("Failed to write cache file %s: %v", cacheFile, err)
-		return
-	}
-
+	// The on-disk entry is a single file:
+	//
+	//	[4]byte metadata length (little-endian) | metadata JSON | body
+	//
+	// Publishing it takes one atomic rename, so a concurrent reader can
+	// never observe a body without its metadata. With the older two-file
+	// layout there was a window between the body rename and the metadata
+	// rename in which a request saw a cache miss and sent WOL for a
+	// response that was actually being cached.
 	metaData, err := json.Marshal(meta)
 	if err != nil {
 		cs.logger.Error("Failed to marshal cache metadata: %v", err)
 		return
 	}
 
-	if err := os.WriteFile(metaFile, metaData, 0644); err != nil {
-		cs.logger.Error("Failed to write cache metadata %s: %v", metaFile, err)
+	envelope := make([]byte, 4, 4+len(metaData)+len(body))
+	binary.LittleEndian.PutUint32(envelope, uint32(len(metaData)))
+	envelope = append(envelope, metaData...)
+	envelope = append(envelope, body...)
+
+	if err := writeFileAtomic(cacheFile, envelope); err != nil {
+		cs.logger.Error("Failed to write cache file %s: %v", cacheFile, err)
 		return
 	}
+	// Drop a legacy metadata sidecar left behind by older versions.
+	os.Remove(cacheFile + ".meta")
 
 	cs.entriesMu.Lock()
 	cs.entries[k] = meta
@@ -336,6 +355,78 @@ func (cs *CacheStore) Save(targetName, path string, statusCode int, headers http
 	cs.entriesMu.Unlock()
 
 	cs.logger.Info("Cache updated for %s %s", targetName, path)
+}
+
+// hopByHopHeaders are connection-specific or framing headers that must not be
+// stored and replayed when a cached response is served from disk: the server
+// sending the cached response re-adds the correct framing (Content-Length or
+// chunking) for the actual body.
+var hopByHopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"TE",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+	"Content-Length",
+}
+
+func sanitizeCachedHeaders(headers http.Header) http.Header {
+	sanitized := make(http.Header, len(headers))
+	for key, values := range headers {
+		skip := false
+		for _, hop := range hopByHopHeaders {
+			if strings.EqualFold(key, hop) {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+		sanitized[key] = values
+	}
+	return sanitized
+}
+
+// parseCacheEnvelope splits a single-file cache entry
+// ([4]byte metadata length (little-endian) | metadata JSON | body).
+// ok is false when data is not an envelope (e.g. a legacy two-file body), in
+// which case the caller falls back to the legacy layout.
+func parseCacheEnvelope(data []byte) (meta cacheEntry, body []byte, ok bool) {
+	if len(data) < 4 {
+		return
+	}
+	metaLen := int(binary.LittleEndian.Uint32(data[:4]))
+	if metaLen <= 0 || 4+metaLen > len(data) {
+		return
+	}
+	if err := json.Unmarshal(data[4:4+metaLen], &meta); err != nil {
+		return
+	}
+	if meta.Path == "" {
+		return
+	}
+	meta.Body = data[4+metaLen:]
+	body = meta.Body
+	ok = true
+	return
+}
+
+// writeFileAtomic writes data to a temp file in the same directory and renames
+// it into place, so readers never see a partially written file.
+func writeFileAtomic(path string, data []byte) error {
+	tmpFile := path + ".tmp"
+	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpFile, path); err != nil {
+		os.Remove(tmpFile)
+		return err
+	}
+	return nil
 }
 
 func (cs *CacheStore) Get(targetName, path string) (*http.Response, bool) {
@@ -451,30 +542,39 @@ func (cs *CacheStore) loadAll() {
 			}
 
 			cacheFile := filepath.Join(dir, file.Name())
-			metaFile := cacheFile + ".meta"
-
-			metaData, err := os.ReadFile(metaFile)
-			if err != nil {
-				continue
-			}
 
 			var entry cacheEntry
-			if err := json.Unmarshal(metaData, &entry); err != nil {
-				continue
+			if metaData, err := os.ReadFile(cacheFile + ".meta"); err == nil {
+				// Legacy two-file layout: body in cacheFile, metadata in the
+				// ".meta" sidecar
+				if err := json.Unmarshal(metaData, &entry); err != nil {
+					continue
+				}
+				body, err := os.ReadFile(cacheFile)
+				if err != nil {
+					continue
+				}
+				entry.Body = body
+			} else {
+				// Single-file envelope layout
+				data, err := os.ReadFile(cacheFile)
+				if err != nil {
+					continue
+				}
+				if meta, body, ok := parseCacheEnvelope(data); !ok {
+					continue
+				} else {
+					entry = meta
+					entry.Body = body
+				}
 			}
 
 			if time.Since(entry.Timestamp) > cs.ttl {
 				os.Remove(cacheFile)
-				os.Remove(metaFile)
+				os.Remove(cacheFile + ".meta")
 				continue
 			}
 
-			body, err := os.ReadFile(cacheFile)
-			if err != nil {
-				continue
-			}
-
-			entry.Body = body
 			k := file.Name()[:len(file.Name())-len(".cache")]
 			cs.entries[k] = &entry
 			cs.keyToTarget[k] = targetName
@@ -1204,8 +1304,25 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 	p.logger.Info("Target %s appears down (%s), attempting to wake", targetName, reason)
 	p.healthChecker.CloseIdleConnections()
 	if _, err := p.wakeAndWait(r.Context(), targetState); err != nil {
+		if r.Context().Err() != nil {
+			// The client went away while the wake was pending. The wake itself
+			// runs independently of this request (see wakeAndWait), so the
+			// target will still be confirmed (and the cache refreshed) in the
+			// background; only this client gets no response.
+			p.logger.Info("Client %s disconnected while waiting for %s to wake (%v)",
+				r.RemoteAddr, targetName, err)
+			return
+		}
 		p.logger.Error("Failed to wake target %s: %v", targetName, err)
 		http.Error(w, "Service temporarily unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	if err := r.Context().Err(); err != nil {
+		// The wake completed in the background but the client no longer wants
+		// the response. The next request will hit the now-healthy target.
+		p.logger.Info("Client %s disconnected while %s was waking; aborting request",
+			r.RemoteAddr, targetName)
 		return
 	}
 
@@ -1319,7 +1436,18 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, target *TargetState) (in
 	p.logger.Info("WOL packet sent to %s (%s), waiting for server to wake (gen=%d)",
 		target.Target.Name, target.Target.Hostname, gen)
 
-	err := p.waitForWake(ctx, target, gen)
+	// Run the wake on its own context instead of the client's: clients
+	// routinely time out (e.g. 10s) long before a machine can boot
+	// (startup_time defaults to 30s). Tying the wait to the request context
+	// aborted the wake every time an impatient client gave up, so the proxy
+	// never confirmed the wake, every retry started a fresh wake generation
+	// (re-sending WOL packets), and the post-wake cache refresh never ran.
+	// The wake now completes in the background; the originating request
+	// simply stops waiting when its client leaves (handled by the caller).
+	wakeCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := p.waitForWake(wakeCtx, target, gen)
 
 	// waitForWake already resets IsWaking on every return path; here we just
 	// record the outcome and release anyone who joined this wake generation.
@@ -1462,7 +1590,15 @@ func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState, wak
 				target.Target.Name, target.Target.Hostname, wakeDuration, wakeGen)
 
 			if p.cache != nil && p.config.CacheEnabled {
-				p.cache.InvalidateTarget(target.Target.Name)
+				// Refresh the cached paths now that the target is reachable
+				// again. This used to only *invalidate* the cache and rely on
+				// the next warm tick (up to warm_interval later) or a future
+				// proxied GET to repopulate it: if the target went offline
+				// before that happened, cached endpoints (e.g. /models) fell
+				// back to triggering WOL on every request. Refreshing in place
+				// (instead of deleting first) also keeps the previous entries
+				// servable if the refresh itself fails.
+				go p.warmCache(target.Target.Name)
 			}
 
 			return nil
