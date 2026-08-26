@@ -27,9 +27,11 @@ func (m *mockWOL) SendWOL(macAddr, broadcastIP string, port int) error {
 
 type mockHealth struct {
 	healthy atomic.Bool
+	checks  atomic.Int32
 }
 
 func (m *mockHealth) Check(ctx context.Context, endpoint string, source string) bool {
+	m.checks.Add(1)
 	return m.healthy.Load()
 }
 func (m *mockHealth) StartBackgroundChecks(ctx context.Context, targets map[string]*TargetState, interval time.Duration) {
@@ -429,6 +431,262 @@ func TestLegacyCacheEntriesStillLoadable(t *testing.T) {
 	}
 	if got := wol.sent.Load(); got != 0 {
 		t.Errorf("WOL sent for a request a legacy cache entry could serve (sent=%d)", got)
+	}
+}
+
+// The global timeout is optional (defaults to 120s) and per-target
+// wake_timeout / wake_health_check_interval must parse into the right maps
+// without leaking into other targets.
+func TestLoadConfigWakeOptions(t *testing.T) {
+	const toml = `
+port = ":9100"
+health_check_interval = "30s"
+health_cache_duration = "10s"
+
+[[targets]]
+name = "llamacpp"
+hostname = "192.168.50.80"
+destination = "http://192.168.50.2:8080"
+health_endpoint = "http://192.168.50.2:8080/health"
+mac_address = "A8:A1:59:40:D6:7D"
+broadcast_ip = "192.168.50.255"
+wake_timeout = "120s"
+wake_health_check_interval = "2s"
+
+[[targets]]
+name = "other"
+hostname = "other.host.com"
+destination = "http://other.local"
+health_endpoint = "http://other.local/health"
+mac_address = "AA:BB:CC:DD:EE:FF"
+broadcast_ip = "10.0.0.255"
+`
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(toml), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("config failed to load: %v", err)
+	}
+	if got := cfg.Timeout; got != 120*time.Second {
+		t.Errorf("default Timeout = %v, want 120s", got)
+	}
+	if got := cfg.WakeTimeouts["llamacpp"]; got != 120*time.Second {
+		t.Errorf("WakeTimeouts[llamacpp] = %v, want 120s", got)
+	}
+	if got := cfg.WakeCheckIntervals["llamacpp"]; got != 2*time.Second {
+		t.Errorf("WakeCheckIntervals[llamacpp] = %v, want 2s", got)
+	}
+	if _, ok := cfg.WakeTimeouts["other"]; ok {
+		t.Error("target without wake_timeout must not be in WakeTimeouts")
+	}
+	if _, ok := cfg.WakeCheckIntervals["other"]; ok {
+		t.Error("target without wake_health_check_interval must not be in WakeCheckIntervals")
+	}
+}
+
+// startup_time must stay below the *effective* wake timeout: both the global
+// default (no timeout key) and a per-target wake_timeout.
+func TestLoadConfigWakeValidation(t *testing.T) {
+	const base = `
+port = ":9100"
+health_check_interval = "30s"
+health_cache_duration = "10s"
+%s
+[[targets]]
+name = "llamacpp"
+hostname = "192.168.50.80"
+destination = "http://192.168.50.2:8080"
+health_endpoint = "http://192.168.50.2:8080/health"
+mac_address = "A8:A1:59:40:D6:7D"
+broadcast_ip = "192.168.50.255"
+%s
+`
+	load := func(t *testing.T, extra, targetExtra string) error {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(fmt.Sprintf(base, extra, targetExtra)), 0644); err != nil {
+			t.Fatal(err)
+		}
+		_, err := LoadConfig(path)
+		return err
+	}
+
+	if err := load(t, `startup_time = "150s"`, ""); err == nil ||
+		!strings.Contains(err.Error(), "must be less than timeout") {
+		t.Errorf("startup_time above the default timeout must be rejected, got: %v", err)
+	}
+	if err := load(t, `startup_time = "90s"`, `wake_timeout = "30s"`); err == nil ||
+		!strings.Contains(err.Error(), "must be less than wake_timeout") {
+		t.Errorf("startup_time above a per-target wake_timeout must be rejected, got: %v", err)
+	}
+}
+
+// A per-target wake_timeout must bound the wake (not the global timeout), a
+// failed wake must release IsWaking, and the next request must start a fresh
+// wake generation.
+func TestPerTargetWakeTimeoutHonoredAndRetryable(t *testing.T) {
+	backend := newTestBackend(t, false)
+	p, _, wol, hc, logger, ts := setupProxyWithPaths(t, backend, []string{"/models"}, 100*time.Millisecond)
+	p.config.WakeTimeouts = map[string]time.Duration{"llamacpp": 400 * time.Millisecond}
+	proxySrv := httptest.NewServer(http.HandlerFunc(p.handleRequest))
+	t.Cleanup(proxySrv.Close)
+	client := &http.Client{}
+
+	// Target stays down for the whole test.
+	hc.healthy.Store(false)
+	ts.setHealth(false)
+
+	// Request 1: /other is not a cached path, so it must go through the wake.
+	// The wake must give up after the 400ms per-target timeout - not the
+	// 10s global one - and the client gets a 503.
+	start := time.Now()
+	status, _, err := getFrom(t, client, proxySrv.URL+"/other", 3*time.Second)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", status)
+	}
+	if elapsed >= 2*time.Second {
+		t.Errorf("wake took %v; the per-target 400ms timeout was not honored (global is 10s)", elapsed)
+	}
+	if !strings.Contains(logger.text(), "after 400ms") {
+		t.Errorf("expected the timeout error to report the 400ms per-target wake timeout:\n%s", logger.text())
+	}
+	// 1 initial packet + burst of 1 at t=0 + one re-burst after the first
+	// failed check (each loop iteration re-sends the burst before waiting).
+	if got := wol.sent.Load(); got != 3 {
+		t.Errorf("WOL packets after first wake = %d, want 3", got)
+	}
+	ts.mu.RLock()
+	waking := ts.IsWaking
+	ts.mu.RUnlock()
+	if waking {
+		t.Fatal("IsWaking must be released after a failed wake")
+	}
+
+	// Request 2: a fresh wake generation must be able to start.
+	start = time.Now()
+	status, _, err = getFrom(t, client, proxySrv.URL+"/other", 3*time.Second)
+	if err != nil || status != http.StatusServiceUnavailable {
+		t.Fatalf("retry after failed wake: status=%d err=%v, want 503", status, err)
+	}
+	if elapsed := time.Since(start); elapsed >= 2*time.Second {
+		t.Errorf("second wake took %v; the per-target timeout was not honored", elapsed)
+	}
+	if got := wol.sent.Load(); got != 6 {
+		t.Errorf("WOL packets after second wake = %d, want 6 (new generation sent its own 3)", got)
+	}
+}
+
+// The request that triggers the wake and a request that joins it must both
+// be served from the SAME wake generation: one WOL burst, both 200s.
+func TestInitiatorAndJoinerShareOneWake(t *testing.T) {
+	backend := newTestBackend(t, false)
+	p, _, wol, hc, logger, _ := setupProxyWithPaths(t, backend, []string{"/models"}, 150*time.Millisecond)
+	proxySrv := httptest.NewServer(http.HandlerFunc(p.handleRequest))
+	t.Cleanup(proxySrv.Close)
+	client := &http.Client{}
+
+	// Target starts down; it boots 250ms after the wake begins. The wake
+	// checks at ~150ms (miss) and ~650ms (hit, 500ms adaptive floor).
+	hc.healthy.Store(false)
+	ts := p.config.Targets["llamacpp"]
+	ts.setHealth(false)
+
+	go func() {
+		time.Sleep(250 * time.Millisecond)
+		hc.healthy.Store(true)
+	}()
+
+	type result struct {
+		status int
+		err    error
+	}
+	resA := make(chan result, 1)
+	resB := make(chan result, 1)
+	go func() {
+		st, _, err := getFrom(t, client, proxySrv.URL+"/models", 5*time.Second)
+		resA <- result{st, err}
+	}()
+	time.Sleep(100 * time.Millisecond) // wake is in progress by now
+	go func() {
+		st, _, err := getFrom(t, client, proxySrv.URL+"/models", 5*time.Second)
+		resB <- result{st, err}
+	}()
+
+	a, b := <-resA, <-resB
+	if a.err != nil || a.status != 200 {
+		t.Fatalf("initiator: status=%d err=%v, want 200", a.status, a.err)
+	}
+	if b.err != nil || b.status != 200 {
+		t.Fatalf("joiner: status=%d err=%v, want 200 (it must share the in-flight wake, not start a new one)", b.status, b.err)
+	}
+	if got := logger.count("waiting for server to wake"); got != 1 {
+		t.Errorf("expected exactly 1 wake generation, got %d:\n%s", got, logger.text())
+	}
+	if logger.count("joining existing wait") == 0 {
+		t.Errorf("expected a 'joining existing wait' log line:\n%s", logger.text())
+	}
+	// 1 initial + burst of 1 at t=0, one re-burst after the first failed
+	// check at ~150ms, then the ~650ms check hits and no more bursts go out.
+	if got := wol.sent.Load(); got != 3 {
+		t.Errorf("WOL packets = %d, want 3 (single generation)", got)
+	}
+}
+
+// With wake_health_check_interval set, the wake must poll at a fixed interval
+// after the initial startup_time quiet period (here: 1.5s + 500ms), catching
+// a machine that booted at 1.55s at ~2.0s - well before the adaptive
+// 1.5s/750ms halving schedule would check again at ~2.25s.
+func TestWakeFixedCheckInterval(t *testing.T) {
+	backend := newTestBackend(t, false)
+	p, _, wol, hc, _, ts := setupProxyWithPaths(t, backend, []string{"/models"}, 1500*time.Millisecond)
+	p.config.WakeCheckIntervals = map[string]time.Duration{"llamacpp": 500 * time.Millisecond}
+	proxySrv := httptest.NewServer(http.HandlerFunc(p.handleRequest))
+	t.Cleanup(proxySrv.Close)
+	client := &http.Client{}
+
+	hc.healthy.Store(false)
+	ts.setHealth(false)
+
+	go func() {
+		time.Sleep(1550 * time.Millisecond)
+		hc.healthy.Store(true)
+	}()
+
+	start := time.Now()
+	go func() {
+		getFrom(t, client, proxySrv.URL+"/other", 5*time.Second)
+	}()
+
+	deadline := time.Now().Add(2250 * time.Millisecond)
+	for {
+		ts.mu.RLock()
+		healthy := ts.IsHealthy
+		ts.mu.RUnlock()
+		if healthy {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("wake did not confirm the target within 2.25s (fixed 500ms interval would hit it at ~2.0s; adaptive halving only at ~2.25s)")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	elapsed := time.Since(start)
+	t.Logf("fixed-interval wake confirmed target after %v", elapsed.Round(time.Millisecond))
+
+	if got := hc.checks.Load(); got != 2 {
+		t.Errorf("health checks during wake = %d, want 2 (one at ~1.5s, one at ~2.0s)", got)
+	}
+	// 1 initial + burst of 1 at t=0, one re-burst after the failed check at
+	// ~1.5s, then the ~2.0s check hits.
+	if got := wol.sent.Load(); got != 3 {
+		t.Errorf("WOL packets = %d, want 3 (single generation)", got)
 	}
 }
 

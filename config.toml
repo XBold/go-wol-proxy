@@ -1,6 +1,6 @@
 port = ":8080"                  # Port to listen on
-timeout = "1m"                  # How long to wait for server to wake up
-startup_time = "30s"            # Initial wait time between WOL bursts (must be less than timeout)
+timeout = "1m"                  # Default wake timeout: how long to wait for a target to boot after WOL (per-target wake_timeout overrides)
+startup_time = "30s"            # Initial quiet period before the first health check during a wake (must be less than the effective wake timeout)
 response_header_timeout = "1m"  # How long to wait for a response header, e.g. during or after slow or long-running requests/uploads
 health_check_interval = "30s"   # Background health check frequency
 health_cache_duration = "10s"   # How long to trust cached health status
@@ -28,6 +28,9 @@ mac_address = "7c:8b:ad:da:be:51"             # MAC address for WOL
 broadcast_ip = "10.0.0.255"                   # Broadcast IP for WOL
 wol_port = 9                                  # Port for WOL packets
 wol_burst_count = 3                           # Number of WOL packets per burst (1-10, default 3; set to 1 for single packet)
+# Optional: per-target wake behaviour (uncomment to override the defaults)
+#wake_timeout = "120s"                         # How long to wait for THIS target to boot (default: global timeout)
+#wake_health_check_interval = "2s"             # Seconds between health checks while waking, after the initial startup_time (default: adaptive 30s/15s/7.5s/...)
 inactivity_threshold = "1h"                   # Shut down after 1 hour of inactivity
 ssh_host = "service.local:22"                 # SSH host:port for shutdown
 ssh_user = "wol-proxy"                        # SSH username for shutdown

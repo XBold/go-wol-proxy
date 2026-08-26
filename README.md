@@ -18,7 +18,8 @@ The service is configured using a TOML file. Here's an example configuration:
 
 ```toml
 port = ":8080"                  # Port to listen on
-timeout = "1m"                  # How long to wait for server to wake up
+timeout = "1m"                  # Default wake timeout: how long to wait for a target to boot after WOL (per-target wake_timeout overrides; default 120s if unset)
+startup_time = "30s"            # Initial quiet period before the first health check during a wake (must be less than the effective wake timeout)
 response_header_timeout = "1m"  # How long to wait for a response header, e.g. during or after slow or long-running requests/uploads
 health_check_interval = "30s"   # Background health check frequency
 health_cache_duration = "10s"   # How long to trust cached health status
@@ -49,6 +50,9 @@ health_endpoint = "http://service.local/ping" # url to check health
 mac_address = "7c:8b:ad:da:be:51"             # MAC address for WOL
 broadcast_ip = "10.0.0.255"                   # Broadcast IP for WOL
 wol_port = 9                                  # Port for WOL packets
+# Optional: per-target wake behaviour
+#wake_timeout = "120s"                         # How long to wait for THIS target to boot (default: global timeout)
+#wake_health_check_interval = "2s"             # Seconds between health checks while waking, after the initial startup_time (default: adaptive 30s/15s/7.5s/...)
 # Optional: Graceful shutdown configuration (SSH or HTTP)
 inactivity_threshold = "1h"                   # Shut down after 1 hour of inactivity
 
@@ -151,6 +155,20 @@ docker-compose up -d
 ### Validation Rules
 - You cannot set both `shutdown_http_url` and `shutdown_command` for the same target.
 - If `shutdown_http_method` and/or `shutdown_http_ok_status` are set, `shutdown_http_url` must also be set.
+
+## Wake Behaviour
+
+Wake-on-LAN is deliberately decoupled from any client request:
+
+- **Wakes run in the background.** When a request finds a target down, the proxy starts one wake (WOL packet + health polling) owned by the proxy itself, on a context that is independent of the request. Clients routinely time out (e.g. 10s) long before a machine can boot (30s+), so a client timing out or disconnecting only stops *that client from waiting* - it never cancels the wake. The target is still confirmed healthy, and the post-wake cache refresh still runs, even if every waiting client gave up.
+- **Concurrent requests share one wake.** If several requests arrive for the same downed target while a wake is in flight, they all join the same wake generation instead of each sending their own WOL packets.
+- **Wake deadline.** The wake gives up after the target's wake timeout: its `wake_timeout` if set, otherwise the global `timeout` (default 120s when unset). Normal request forwarding is unaffected and still bounded by `response_header_timeout`.
+- **Health check cadence during a wake.** After WOL is sent, the proxy waits `startup_time` (the machine cannot answer a health check yet), then re-checks on a schedule: by default the wait is halved on every retry (30s, 15s, 7.5s, ... down to a 500ms floor); set `wake_health_check_interval` to poll at a fixed interval instead (e.g. `2s` spots a booted machine within two seconds, also floored at 500ms).
+
+### Per-target wake options
+
+- `wake_timeout`: How long to wait for this specific target to boot (e.g. `"120s"`). Useful when one machine boots much slower than the others; the global `timeout` stays the default for all targets that do not set it.
+- `wake_health_check_interval`: Fixed seconds between health checks while this target is waking, after the initial `startup_time` quiet period (e.g. `"2s"`). Unset = adaptive halving of `startup_time`.
 
 ## Static Response Cache
 
