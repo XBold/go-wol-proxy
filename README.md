@@ -85,14 +85,14 @@ wol_port = 9
 ### Pull the Docker Image
 
 ```bash
-docker pull ghcr.io/darksworm/go-wol-proxy:latest
+docker pull ghcr.io/xbold/go-wol-proxy:latest
 ```
 
 ### Run the Docker Container
 
 ```bash
 # Note: network mode "host" is required for Wake-on-LAN packets to be sent correctly
-docker run --network host -v /path/to/config.toml:/app/config.toml ghcr.io/darksworm/go-wol-proxy:latest
+docker run --network host -v /path/to/config.toml:/app/config.toml ghcr.io/xbold/go-wol-proxy:latest
 ```
 
 ### Build the Docker Image Locally
@@ -117,7 +117,7 @@ version: '3'
 
 services:
   go-wol-proxy:
-    image: ghcr.io/darksworm/go-wol-proxy:latest
+    image: ghcr.io/xbold/go-wol-proxy:latest
     # Note: network mode "host" is required for Wake-on-LAN packets to be sent correctly
     network_mode: host
     restart: unless-stopped
@@ -208,7 +208,7 @@ If using Docker and enabling the cache, mount the cache directory to persist acr
 docker run --network host \
   -v /path/to/config.toml:/app/config.toml \
   -v /path/to/cache:/app/cache \
-  ghcr.io/darksworm/go-wol-proxy:latest
+  ghcr.io/xbold/go-wol-proxy:latest
 ```
 
 ### Similar projects:
