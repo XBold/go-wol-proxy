@@ -524,6 +524,83 @@ broadcast_ip = "192.168.50.255"
 	}
 }
 
+// The server's read/write timeouts must default to 0 (no timeout) so long SSE
+// streams are not killed: a positive default would terminate them. "0" and an
+// absent key must both give 0, positive values must parse, and invalid or
+// negative values must be rejected (a negative http.Server timeout is an
+// already-passed deadline and would fail every request instantly).
+func TestLoadConfigServerTimeouts(t *testing.T) {
+	const base = `
+port = ":9100"
+health_check_interval = "30s"
+health_cache_duration = "10s"
+%s
+[[targets]]
+name = "llamacpp"
+hostname = "192.168.50.80"
+destination = "http://192.168.50.2:8080"
+health_endpoint = "http://192.168.50.2:8080/health"
+mac_address = "A8:A1:59:40:D6:7D"
+broadcast_ip = "192.168.50.255"
+`
+	load := func(t *testing.T, extra string) (*ProxyConfig, error) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(fmt.Sprintf(base, extra)), 0644); err != nil {
+			t.Fatal(err)
+		}
+		return LoadConfig(path)
+	}
+
+	// Absent keys -> 0 (no timeout)
+	cfg, err := load(t, "")
+	if err != nil {
+		t.Fatalf("config without timeouts must load: %v", err)
+	}
+	if cfg.ResponseTimeout != 0 || cfg.RequestTimeout != 0 {
+		t.Errorf("unset timeouts must be 0 (no timeout), got response=%v request=%v",
+			cfg.ResponseTimeout, cfg.RequestTimeout)
+	}
+
+	// Explicit "0" -> 0 (no timeout)
+	cfg, err = load(t, `response_timeout = "0"
+request_timeout = "0"`)
+	if err != nil {
+		t.Fatalf("explicit 0 timeouts must load: %v", err)
+	}
+	if cfg.ResponseTimeout != 0 || cfg.RequestTimeout != 0 {
+		t.Errorf("explicit 0 timeouts must stay 0, got response=%v request=%v",
+			cfg.ResponseTimeout, cfg.RequestTimeout)
+	}
+
+	// Positive values parse
+	cfg, err = load(t, `response_timeout = "10m"
+request_timeout = "30s"`)
+	if err != nil {
+		t.Fatalf("positive timeouts must load: %v", err)
+	}
+	if cfg.ResponseTimeout != 10*time.Minute || cfg.RequestTimeout != 30*time.Second {
+		t.Errorf("positive timeouts wrong: response=%v request=%v",
+			cfg.ResponseTimeout, cfg.RequestTimeout)
+	}
+
+	// Invalid values rejected
+	if _, err := load(t, `response_timeout = "10 bananas"`); err == nil {
+		t.Error("invalid response_timeout must be rejected")
+	}
+	if _, err := load(t, `request_timeout = "10"`); err == nil {
+		t.Error("request_timeout without a unit must be rejected")
+	}
+
+	// Negative values rejected
+	if _, err := load(t, `response_timeout = "-1m"`); err == nil {
+		t.Error("negative response_timeout must be rejected")
+	}
+	if _, err := load(t, `request_timeout = "-5s"`); err == nil {
+		t.Error("negative request_timeout must be rejected")
+	}
+}
+
 // A per-target wake_timeout must bound the wake (not the global timeout), a
 // failed wake must release IsWaking, and the next request must start a fresh
 // wake generation.

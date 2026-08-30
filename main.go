@@ -1889,21 +1889,29 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		return nil, fmt.Errorf("invalid response_header_timeout: %w", err)
 	}
 
-	// Parse response_timeout: 0 means no timeout (useful for SSE/long streams)
+	// Parse response_timeout: 0 means no timeout (useful for SSE/long streams).
+	// A negative value is rejected: it would be an already-passed deadline,
+	// making every request fail instantly.
 	responseTimeout := time.Duration(0)
 	if config.ResponseTimeout != "" {
 		responseTimeout, err = time.ParseDuration(config.ResponseTimeout)
 		if err != nil {
 			return nil, fmt.Errorf("invalid response_timeout: %w", err)
 		}
+		if responseTimeout < 0 {
+			return nil, fmt.Errorf("response_timeout must not be negative, got %s", config.ResponseTimeout)
+		}
 	}
 
-	// Parse request_timeout: 0 means no timeout (useful for SSE/long streams)
+	// Parse request_timeout: 0 means no timeout (useful for SSE/long streams).
 	requestTimeout := time.Duration(0)
 	if config.RequestTimeout != "" {
 		requestTimeout, err = time.ParseDuration(config.RequestTimeout)
 		if err != nil {
 			return nil, fmt.Errorf("invalid request_timeout: %w", err)
+		}
+		if requestTimeout < 0 {
+			return nil, fmt.Errorf("request_timeout must not be negative, got %s", config.RequestTimeout)
 		}
 	}
 
