@@ -94,6 +94,8 @@ type Config struct {
 	Timeout               string      `toml:"timeout"`
 	StartupTime           string      `toml:"startup_time"`
 	ResponseHeaderTimeout string      `toml:"response_header_timeout"`
+	ResponseTimeout       string      `toml:"response_timeout"`
+	RequestTimeout        string      `toml:"request_timeout"`
 	HealthCheckInterval   string      `toml:"health_check_interval"`
 	HealthCacheDuration   string      `toml:"health_cache_duration"`
 	SSLCertificate        string      `toml:"ssl_certificate"`
@@ -144,6 +146,8 @@ type ProxyConfig struct {
 	Timeout               time.Duration
 	StartupTime           time.Duration
 	ResponseHeaderTimeout time.Duration
+	ResponseTimeout       time.Duration
+	RequestTimeout        time.Duration
 	HealthCheckInterval   time.Duration
 	HealthCacheDuration   time.Duration
 	LogLevel              string
@@ -1200,8 +1204,8 @@ func (p *ProxyService) Start(ctx context.Context) error {
 	server := &http.Server{
 		Addr:              p.config.Port,
 		Handler:           mux,
-		ReadTimeout:       10 * time.Minute,
-		WriteTimeout:      10 * time.Minute,
+		ReadTimeout:       p.config.RequestTimeout,
+		WriteTimeout:      p.config.ResponseTimeout,
 		IdleTimeout:       120 * time.Second, // 2 minutes for keep-alive connections
 		ReadHeaderTimeout: 30 * time.Second,
 		MaxHeaderBytes:    1 << 20,
@@ -1885,6 +1889,24 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		return nil, fmt.Errorf("invalid response_header_timeout: %w", err)
 	}
 
+	// Parse response_timeout: 0 means no timeout (useful for SSE/long streams)
+	responseTimeout := time.Duration(0)
+	if config.ResponseTimeout != "" {
+		responseTimeout, err = time.ParseDuration(config.ResponseTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("invalid response_timeout: %w", err)
+		}
+	}
+
+	// Parse request_timeout: 0 means no timeout (useful for SSE/long streams)
+	requestTimeout := time.Duration(0)
+	if config.RequestTimeout != "" {
+		requestTimeout, err = time.ParseDuration(config.RequestTimeout)
+		if err != nil {
+			return nil, fmt.Errorf("invalid request_timeout: %w", err)
+		}
+	}
+
 	healthCheckInterval, err := time.ParseDuration(config.HealthCheckInterval)
 	if err != nil {
 		return nil, fmt.Errorf("invalid health_check_interval: %w", err)
@@ -2037,6 +2059,8 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		Timeout:               timeout,
 		StartupTime:           startupTime,
 		ResponseHeaderTimeout: responseHeaderTimeout,
+		ResponseTimeout:       responseTimeout,
+		RequestTimeout:        requestTimeout,
 		HealthCheckInterval:   healthCheckInterval,
 		HealthCacheDuration:   healthCacheDuration,
 		LogLevel:              config.LogLevel,

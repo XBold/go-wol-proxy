@@ -2,6 +2,8 @@ port = ":8080"                  # Port to listen on
 timeout = "1m"                  # Default wake timeout: how long to wait for a target to boot after WOL (per-target wake_timeout overrides)
 startup_time = "30s"            # Initial quiet period before the first health check during a wake (must be less than the effective wake timeout)
 response_header_timeout = "1m"  # How long to wait for a response header, e.g. during or after slow or long-running requests/uploads
+response_timeout = "0"          # HTTP WriteTimeout: 0 = no timeout (useful for SSE/long streaming responses), e.g. "10m", "30s"
+request_timeout = "0"           # HTTP ReadTimeout: 0 = no timeout (useful for SSE/long streaming requests), e.g. "10m", "30s"
 health_check_interval = "30s"   # Background health check frequency
 health_cache_duration = "10s"   # How long to trust cached health status
 log_level = "info"              # Log level: debug, info, warn, error
