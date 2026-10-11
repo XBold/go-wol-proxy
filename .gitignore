@@ -1,3 +1,11 @@
 *.iml
 *.idea/
 .aider*
+
+# build output
+doormouse
+go-wol-proxy
+*.migrated.toml
+
+# release build output
+dist/

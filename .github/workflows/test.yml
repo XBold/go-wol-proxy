@@ -1,0 +1,84 @@
+name: Test
+
+# pull_request covers review; workflow_call lets the release pipeline gate on
+# this same job instead of duplicating it. Deliberately no push trigger: it
+# would double-run on main, once here and once through the call.
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # Nothing here needs git credentials, and pull_request runs code from
+          # the branch, so keep the token out of .git/config.
+          persist-credentials: false
+
+      # setup-go caches the module and build caches by default, keyed on go.sum.
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Check formatting (gofmt)
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Files not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # staticcheck itself needs a newer Go than the one go.mod pins for
+      # doormouse, so let the go command fetch that toolchain for this step.
+      # Tests still run on the version go.mod declares.
+      - name: Run staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
+        env:
+          GOTOOLCHAIN: auto
+
+      # -race catches the data races the ManualClock tests are built to expose;
+      # -shuffle=on stops tests depending on declaration order.
+      - name: Test
+        run: go test -race -shuffle=on ./...
+
+  # The release image sets a file capability in a RUN step, which on arm64 runs
+  # under emulation on an amd64 runner. Build it here so a release is not the
+  # first place that breaks. Go end-to-end tests exercise the native release
+  # image's runtime permissions and the wake/proxy/shutdown lifecycle.
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          # Nothing here needs git credentials, and pull_request runs code from
+          # the branch, so keep the token out of .git/config.
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build both release architectures
+        run: docker buildx bake release --set release.output=type=cacheonly
+
+      - name: Test container end to end
+        run: go -C e2e test -race -count=1 -timeout=5m -v ./...

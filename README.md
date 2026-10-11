@@ -1,240 +1,531 @@
-# Go WOL Proxy
+<h1 align="center">
+  <img src="assets/doormouse.svg" alt="doormouse" width="400">
+</h1>
 
-A Wake-on-LAN proxy service written in Go that automatically wakes up servers when requests are made to them.
+<p align="center">
+  <strong>A reverse proxy that wakes your servers when someone knocks.</strong>
+</p>
 
-## Features
+Most homelabs grow one machine that costs real money to run: a NAS with a stack
+of spinning disks, a box with a GPU in it for LLM inference or transcoding, an
+old workstation kept around for backups. You need it a few hours a day. It draws
+power for all twenty-four. Turning it off saves that power, but then the services
+on it are gone exactly when you want them.
 
-- Proxies HTTP requests to configured target servers
-- Automatically sends Wake-on-LAN packets to wake up offline servers
-- Monitors server health with configurable intervals
-- Caches health status to minimize latency for frequent requests
-- **Caches HTTP responses to disk** - serves stale content when destinations are offline, preventing unnecessary wake-ups
-- Packaged as a Docker container for easy deployment
-- :star: new :star: Supports graceful shutdown of servers after a period of inactivity
+doormouse closes that gap. Run it on the small machine you already keep on all
+the time — a Raspberry Pi, a mini PC, whatever hosts your lighter services — and
+put it in front of the expensive one. When a request arrives for a sleeping
+machine, doormouse sends a Wake-on-LAN magic packet, waits for the host to boot,
+and forwards the request. The client sees one slow response instead of a
+connection error. Once the machine has been idle long enough, doormouse suspends
+it again.
 
-## Configuration
+It handles HTTP and raw TCP, so the same proxy can front a web app and `ssh`. A
+few things it fronts well:
 
-The service is configured using a TOML file. Here's an example configuration:
+- **A NAS** serving photos, media or backups in bursts, idle the rest of the day.
+- **A GPU box** for local LLMs or transcoding, awake only while you are asking it
+  something.
+- **A game server** that sleeps until the first player connects.
+- **A build or CI machine** you hit a handful of times a week.
+
+## Requirements
+
+- **A target host with Wake-on-LAN enabled.** Most wired NICs support it, but it
+  is usually off by default in the BIOS and sometimes in the OS as well.
+- **An always-on host to run doormouse.** A Raspberry Pi is enough.
+- **Both hosts in the same broadcast domain.** Magic packets do not route.
+
+> [!NOTE]
+> "Sleep" is whatever your `shutdown_command` does, so suspend, hibernate and
+> full poweroff all work. Poweroff wakes the most reliably. Suspend is faster but
+> some boards will not resume from it. Test yours before you depend on it.
+
+## Quick start
+
+Write `config.toml`:
 
 ```toml
-port = ":8080"                  # Port to listen on
-timeout = "1m"                  # Default wake timeout: how long to wait for a target to boot after WOL (per-target wake_timeout overrides; default 120s if unset)
-startup_time = "30s"            # Initial quiet period before the first health check during a wake (must be less than the effective wake timeout)
-response_header_timeout = "1m"  # How long to wait for a response header, e.g. during or after slow or long-running requests/uploads
-response_timeout = "0"          # HTTP server write timeout (responses to clients): 0 = no timeout, keep 0 for long SSE streams
-request_timeout = "0"           # HTTP server read timeout (requests from clients): 0 = no timeout, keep 0 for long SSE streams
-health_check_interval = "30s"   # Background health check frequency
-health_cache_duration = "10s"   # How long to trust cached health status
-log_level = "info"              # Log level: debug, info, warn, error
-# Best-effort reverse DNS lookup of client IPs in request logs (enabled by default)
-client_hostname_lookup = true   # Set to false to skip reverse DNS lookups
+port = ":8080"
+timeout = "1m"
+poll_interval = "5s"
+health_check_interval = "30s"
+health_cache_duration = "10s"
 
-# Static response cache - serves cached content when destinations are offline
-# Prevents unnecessary WOL triggers for cached paths
-[cache]
-enabled = false                              # Enable static response caching
-root_path = "./cache"                        # Directory to store cached responses
-ttl = "24h"                                  # How long cached entries remain valid
-max_response_size_bytes = 10485760           # Maximum response size to cache (10MB)
-warm_interval = "30m"                        # How often to refresh cache when target is healthy
-
-[[cache.targets]]
-target = "service"                           # Target name (must match a target's name field)
-paths = ["/docs", "/assets", "/static/*"]    # Paths to cache (supports /* wildcard)
-
-# Optional SSL configuration Do not add these values unless you plan to use TLS/HTTPS
-ssl_certificate = "/path/to/cert.pem"   # Path to your SSL certificate
-ssl_certificate_key = "/path/to/key.pem" # Path to your SSL private key
-
-
-[[targets]]
-name = "service"
-hostname = "service.host.com"                 # The "external" hostname - what this server receives as a Host header
-destination = "http://service.local"          # The actual url to the server
-health_endpoint = "http://service.local/ping" # url to check health
-mac_address = "7c:8b:ad:da:be:51"             # MAC address for WOL
-broadcast_ip = "10.0.0.255"                   # Broadcast IP for WOL
-wol_port = 9                                  # Port for WOL packets
-# Optional: per-target wake behaviour
-#wake_timeout = "120s"                         # How long to wait for THIS target to boot (default: global timeout)
-#wake_health_check_interval = "2s"             # Seconds between health checks while waking, after the initial startup_time (default: adaptive 30s/15s/7.5s/...)
-# Optional: Graceful shutdown configuration (SSH or HTTP)
-inactivity_threshold = "1h"                   # Shut down after 1 hour of inactivity
-
-# Option A: SSH-based shutdown (use either Option A or Option B, not both)
-ssh_host = "service.local:22"                 # SSH host:port for shutdown
-ssh_user = "wol-proxy"                        # SSH username for shutdown
-ssh_key_path = "/app/private_key"             # Path to SSH private key
-ssh_known_hosts = "/app/known_hosts"          # Path to known_hosts file (optional; omits host key verification if unset)
-shutdown_command = "sudo systemctl suspend"   # Command to execute for shutdown
-# ^ take care - wake from suspend / shutdown can be flaky on some systems.
-# if your machine doesnt wake from your chosen "sleep" mode, try another.
-
-# Option B: HTTP-based shutdown (use either Option A or Option B, not both)
-#shutdown_http_url = "http://service.local/api/shutdown" # URL to trigger shutdown (final response validated)
-#shutdown_http_method = "POST"                              # Optional; defaults to POST
-#shutdown_http_ok_status = 0                                 # Optional; 0=accept any 2xx (default). Set e.g. 202 to require specific code
-
-[[targets]]
-name = "service2"
-hostname = "service2.host.com"
-destination = "http://service2.local"
-health_endpoint = "http://service2.local/ping"
-mac_address = "c9:69:45:d2:1e:12"
+[[machines]]
+name = "nas"
+mac_address = "7c:8b:ad:da:be:51"
 broadcast_ip = "10.0.0.255"
-wol_port = 9
+health_check = "tcp://nas.local:22"
+inactivity_threshold = "1h"
+
+ssh_host = "nas.local:22"
+ssh_user = "doormouse"
+ssh_key_path = "/app/ssh_key"
+shutdown_command = "sudo systemctl suspend"
+
+[[routes]]
+machine = "nas"
+hostname = "photos.example.com"
+destination = "http://nas.local:2283"
 ```
 
-## Request Logging
-
-Every incoming request is logged with everything the proxy knows about its sender, so you can tell which service or machine made it:
-
-```
-[INFO] 2026-10-06 04:01:03 Incoming request: host: 192.168.50.80:9100 -> target: llamacpp, path: /v1/chat/completions, method: POST (client: 172.23.0.3:57648 hostname: open-webui user-agent: "openai-python/1.59.3" x-forwarded-for: 192.168.50.15)
-```
-
-- `client` - source IP and port (always present)
-- `hostname` - reverse DNS (PTR) lookup of the client IP, when the network provides one. Results are cached (30 min for names, 2 min for failures) and a lookup never blocks a request for more than 1 second.
-- `user-agent` - the client's User-Agent header, when sent. This is usually the most reliable hint about *which service* made the request (e.g. `openai-python`, `okhttp`, `curl`, a browser, ...)
-- `x-forwarded-for` / `x-real-ip` / `x-forwarded-host` - included when present. These carry the original client address when the request arrives via another proxy
-
-Note: Docker container IPs (e.g. `172.23.0.3`) have no PTR record by default, so `hostname` will usually be absent for them - the `user-agent` is your best clue there.
-
-## Docker Usage
-
-### Pull the Docker Image
-
-```bash
-docker pull ghcr.io/xbold/go-wol-proxy:latest
-```
-
-### Run the Docker Container
-
-```bash
-# Note: network mode "host" is required for Wake-on-LAN packets to be sent correctly
-docker run --network host -v /path/to/config.toml:/app/config.toml ghcr.io/xbold/go-wol-proxy:latest
-```
-
-### Build the Docker Image Locally
-
-```bash
-docker build -t go-wol-proxy .
-```
-
-### Run the Locally Built Image
-
-```bash
-# Note: network mode "host" is required for Wake-on-LAN packets to be sent correctly
-docker run --network host -v /path/to/config.toml:/app/config.toml go-wol-proxy
-```
-
-### Docker Compose Usage
-
-Create a `docker-compose.yml` file with the following content:
+Then bring it up:
 
 ```yaml
-version: '3'
-
 services:
-  go-wol-proxy:
-    image: ghcr.io/xbold/go-wol-proxy:latest
-    # Note: network mode "host" is required for Wake-on-LAN packets to be sent correctly
+  doormouse:
+    image: ghcr.io/darksworm/doormouse:latest
     network_mode: host
     restart: unless-stopped
     volumes:
       - ./config.toml:/app/config.toml
-      # Optional: SSH private key and known_hosts for graceful shutdown
-      - ./private_key:/app/private_key
-      # Optional: known_hosts file for SSH host key verification
-      # - ./known_hosts:/app/known_hosts
+      - ./ssh_key:/app/ssh_key
 ```
-
-Run the container with Docker Compose:
 
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
-## Graceful Shutdown Options
+> [!NOTE]
+> doormouse runs in the container as UID 1000, the first user on most Linux
+> hosts. A `0600` key owned by you is therefore readable as it is. If `id -u`
+> says you are not 1000, either `chown 1000:1000 ssh_key` or set `user:` on the
+> service to your own IDs from `id -u` and `id -g`. doormouse warns at startup if
+> it cannot read the key.
 
-- Trigger a shutdown after a period of inactivity using SSH or HTTP.
-- Exactly one mechanism must be configured per target: SSH or HTTP, not both.
+Point `photos.example.com` at the doormouse host, then open
+`http://photos.example.com:8080`. The NAS wakes.
 
-### SSH-based Shutdown
-- Use `ssh_host`, `ssh_user`, `ssh_key_path`, and `shutdown_command`.
-- Optionally set `ssh_known_hosts` to enable host key verification (uses `InsecureIgnoreHostKey()` if unset).
-- The proxy executes the command over SSH when the target is inactive.
+> [!IMPORTANT]
+> Host networking is required. Wake-on-LAN needs to broadcast, which Docker's
+> default bridge network will not carry.
+>
+> Because host networking does not remap ports, the proxy is reachable on
+> whatever `port` says. Set `port = ":80"` if you want the URL without a port, or
+> put doormouse behind a front proxy that terminates TLS.
 
-### HTTP-based Shutdown
-- Use `shutdown_http_url` to enable HTTP shutdown.
-- `shutdown_http_method` defaults to `POST` if not specified.
-- By default, any 2xx status code counts as success; set `shutdown_http_ok_status` to require a specific code.
-- The HTTP client follows redirects and validates the final response code.
-- The shutdown HTTP request uses a 10s timeout.
+## How it works
 
-### Validation Rules
-- You cannot set both `shutdown_http_url` and `shutdown_command` for the same target.
-- If `shutdown_http_method` and/or `shutdown_http_ok_status` are set, `shutdown_http_url` must also be set.
+1. A request arrives for a configured hostname or listen port.
+2. doormouse checks cached machine health. If the host is up, it forwards
+   immediately.
+3. Otherwise it owns a wake: a burst of magic packets, then a health check once
+   the machine has had time to boot, repeating until the host answers or the
+   wake timeout expires. The wake outlives the request that triggered it.
+4. It then waits for the *route* to be ready, which is a separate check.
+5. It forwards the request and streams the response back.
+6. When no route has seen traffic for `inactivity_threshold` and no connection is
+   open, it runs the shutdown command.
 
-## Wake Behaviour
+## Machines and routes
 
-Wake-on-LAN is deliberately decoupled from any client request:
+A **machine** is a host. doormouse wakes and suspends it as one unit.
 
-- **Wakes run in the background.** When a request finds a target down, the proxy starts one wake (WOL packet + health polling) owned by the proxy itself, on a context that is independent of the request. Clients routinely time out (e.g. 10s) long before a machine can boot (30s+), so a client timing out or disconnecting only stops *that client from waiting* - it never cancels the wake. The target is still confirmed healthy, and the post-wake cache refresh still runs, even if every waiting client gave up.
-- **Concurrent requests share one wake.** If several requests arrive for the same downed target while a wake is in flight, they all join the same wake generation instead of each sending their own WOL packets.
-- **Wake deadline.** The wake gives up after the target's wake timeout: its `wake_timeout` if set, otherwise the global `timeout` (default 120s when unset). Normal request forwarding is unaffected and still bounded by `response_header_timeout`.
-- **Health check cadence during a wake.** After WOL is sent, the proxy waits `startup_time` (the machine cannot answer a health check yet), then re-checks on a schedule: by default the wait is halved on every retry (30s, 15s, 7.5s, ... down to a 500ms floor); set `wake_health_check_interval` to poll at a fixed interval instead (e.g. `2s` spots a booted machine within two seconds, also floored at 500ms).
+A **route** is one way in to that machine. One machine can carry many routes: a
+NAS might serve photos, files and `ssh`. That is one machine and three routes.
+Traffic on any route keeps the whole machine awake.
 
-### Per-target wake options
+### Route types
 
-- `wake_timeout`: How long to wait for this specific target to boot (e.g. `"120s"`). Useful when one machine boots much slower than the others; the global `timeout` stays the default for all targets that do not set it.
-- `wake_health_check_interval`: Fixed seconds between health checks while this target is waking, after the initial `startup_time` quiet period (e.g. `"2s"`). Unset = adaptive halving of `startup_time`.
+A route is reached one way or the other, never both.
 
-## Static Response Cache
+| | Matched on | `destination` | Shares `port` |
+|---|---|---|---|
+| **HTTP** | `hostname` (Host header) | `http://nas.local:2283` | Yes |
+| **TCP** | `listen_port` (own socket) | `nas.local:22` | No |
 
-When enabled, the proxy caches HTTP responses for configured paths to disk. This provides several benefits:
+HTTP routes multiplex on the Host header, so any number of them share one port.
+Raw TCP carries no such header. Each TCP route therefore needs its own listener.
 
-- **No unnecessary wake-ups**: When a destination is offline, cached responses are served instead of triggering WOL
-- **Faster responses**: Cached content is served instantly without waiting for the server to wake up
-- **Automatic warming**: Cache is refreshed when targets wake up and periodically (default every 30 minutes)
+```toml
+# HTTP route, matched on the Host header.
+[[routes]]
+machine = "nas"
+hostname = "photos.example.com"
+destination = "http://nas.local:2283"
 
-### How It Works
+# TCP route, own port: ssh -p 2222 you@doormouse-host
+[[routes]]
+machine = "nas"
+listen_port = 2222
+destination = "nas.local:22"
+```
 
-1. **Caching**: Successful GET responses to configured paths are saved to disk (one single-file entry per path, written atomically)
-2. **Serving**: When a destination is down and a cached response exists for the requested path, it's served immediately
-3. **Post-wake refresh**: When a target wakes up, the proxy re-fetches all configured paths and updates the cached entries in place; if a refresh fails, the previous entries stay servable
-4. **Warming**: Healthy targets are re-fetched periodically (`warm_interval`)
+TCP connections are spliced byte for byte. The upstream host key reaches your
+client unmodified, so there is no man-in-the-middle and no key substitution.
 
-Wake-on-LAN is not tied to any single client request: the wake completes in the background even if every waiting client times out, and the cached entries are refreshed as soon as the machine is back.
+> [!NOTE]
+> Your client still sees a different address. It connects to
+> `doormouse-host:2222`, not `nas.local:22`, so OpenSSH looks up a different
+> `known_hosts` entry and prompts on first use. To keep one entry for both paths,
+> set `HostKeyAlias`:
+>
+> ```text
+> Host nas-via-doormouse
+>     HostName doormouse-host
+>     Port 2222
+>     HostKeyAlias nas.local
+> ```
 
-### Configuration
+> [!WARNING]
+> A TCP route is a new way in to that service. The example above exposes the
+> NAS's `sshd` on every interface the doormouse host listens on. Authentication
+> is unaffected, since `sshd` still authenticates every connection. But a service
+> that was previously reachable only from your LAN now depends on where you run
+> the proxy. Bind it somewhere you trust.
 
-- `enabled`: Turn the feature on/off (disabled by default)
-- `root_path`: Directory for cached files (default: `./cache`)
-- `ttl`: How long entries remain valid (default: 24h)
-- `max_response_size_bytes`: Skip caching responses larger than this (default: 10MB)
-- `warm_interval`: How often to refresh cache for healthy targets (default: 30m)
+## Names and DNS
 
-### Path Patterns
+doormouse deals with two kinds of name, resolved in two different places.
 
-- Exact match: `"/docs"` caches only `/docs`
-- Wildcard: `"/static/*"` caches any path starting with `/static/`
+**A route's `hostname` is what the client asks for.** It has to resolve to the
+doormouse host. Not to the machine you want woken, which is asleep and cannot
+answer.
 
-### Docker Volumes
+**A route's `destination` is what doormouse dials.** It resolves on the doormouse
+host, on your LAN.
 
-If using Docker and enabling the cache, mount the cache directory to persist across restarts:
+So `photos.example.com` points at your Raspberry Pi, and doormouse forwards to
+`nas.local:2283` behind it.
+
+### Pointing a hostname at doormouse
+
+Use whichever you already run:
+
+- **A local DNS server**, such as Pi-hole, AdGuard Home, dnsmasq or your router.
+  Add an A record for the hostname with the doormouse host's IP. A wildcard like
+  `*.home.example.com` saves you a record per route.
+- **`/etc/hosts` on one client.** Enough to try it out, tedious past that.
+- **Public DNS**, if you own the domain. Point the A record at the doormouse host.
+
+TCP routes are matched on a port, not a name, so any name that reaches the
+doormouse host will do, including the bare IP.
+
+> [!WARNING]
+> A public A record holding a private address such as `10.0.0.5` is dropped by
+> some resolvers as DNS rebinding. Use a local override instead.
+
+### Names on the far side
+
+`destination` and `health_check` have to resolve while the machine is asleep. A
+name that only exists while the host is up cannot be used to wake it. Give the
+machine a DHCP reservation and a static DNS entry, or write the IP straight into
+the config.
+
+### Names on the near side
+
+By default doormouse does a reverse-DNS (PTR) lookup for each client IP and logs
+the hostname alongside the address, so the request log shows which machine or
+service sent the traffic. The lookup is best-effort and cached (results for 30
+minutes, failures for 2), and it never delays a request. Set
+`client_hostname_lookup = false` to disable it, for example when the network has
+no PTR records or DNS lookups are slow.
+
+## Liveness and readiness
+
+There are two `health_check` fields and they answer different questions.
+
+**`machines[].health_check` is liveness: is the host up?** It drives Wake-on-LAN
+and the wake wait. Point it at something that is always running:
+
+```toml
+health_check = "tcp://nas.local:22"
+```
+
+Do not point it at a single application. If that application crashes, doormouse
+concludes the host is down and fires magic packets at a machine that is already
+awake.
+
+**`routes[].health_check` is readiness: can this route serve?** It gates
+forwarding for that route alone. It defaults to dialling `destination`, inferring
+`:80` or `:443` from the URL scheme when the port is implicit.
+
+Point it at a real health endpoint when a service takes noticeably longer to come
+up than the host does:
+
+```toml
+health_check = "http://nas.local:2283/api/server/ping"
+```
+
+Otherwise a successful wake still yields a 502, because the host is up but the
+service is not yet listening.
+
+Three forms are accepted: `tcp://host:port`, `http://...` and `https://...`.
+
+> [!NOTE]
+> Readiness is polled only while the machine is live. A machine that sleeps all
+> day therefore generates no per-route traffic.
+
+## Wake strategy
+
+Waking a machine is a race against a boot, not against a request. doormouse
+runs each wake as one background operation per machine:
+
+- A burst of `wol_burst_count` magic packets (default 3, 500ms apart) is sent,
+  then doormouse waits `startup_time` before the first health check - a machine
+  that was just woken cannot answer one yet.
+- After that, each cycle re-sends the burst and waits again. The wait halves
+  each cycle (30s, 15s, 7.5s, ... down to 500ms) so the boot is spotted quickly,
+  or stays fixed at `wake_health_check_interval` if you prefer predictable
+  polling.
+- The whole wake is bounded by `wake_timeout` (default: the global `timeout`),
+  independent of any client's deadline.
+- The wake is owned by the proxy, not by the request that triggered it: clients
+  that time out or disconnect stop waiting, but the wake keeps running, the
+  machine still gets confirmed, and later requests join the in-flight wake
+  instead of firing another burst.
+
+```toml
+startup_time = "30s"   # global quiet period before the first health check
+
+[[machines]]
+name = "nas"
+wol_burst_count = 3            # 1-10; some NICs and switches drop a lone packet
+#wake_timeout = "2m"           # per-machine boot budget (default: global timeout)
+#wake_health_check_interval = "2s"  # fixed poll while waking (default: adaptive halving)
+```
+
+## Static response cache
+
+```toml
+[cache]
+enabled = true
+root_path = "./cache"
+ttl = "24h"
+max_response_size_bytes = 10485760
+warm_interval = "30m"
+
+[[cache.routes]]
+route = "files.home.com"
+paths = ["/docs", "/assets/*"]
+```
+
+Some routes serve content that does not need the machine to be awake: a model
+list, static assets, a landing page. With the cache enabled, a `GET` whose path
+matches a configured pattern is served straight from disk when the machine is
+offline, instead of waking it. The client gets a full answer while the box
+stays asleep.
+
+A `/*` suffix caches everything under a prefix (`/assets/*` covers
+`/assets/app.css`). Only `GET` requests with a 2xx status are cached, and only
+for routes named in `[[cache.routes]]`; responses larger than
+`max_response_size_bytes` are skipped.
+
+The cache keeps itself warm: whenever a machine wakes up, and every
+`warm_interval` while it stays up, the configured paths are re-fetched. A
+response whose body has not changed is not rewritten, so a static file list
+does not churn the disk. Entries older than `ttl` are dropped.
+
+> [!NOTE]
+> Cached responses are replayed with the upstream headers they were stored
+> with, minus framing headers. The proxy does not revalidate them against the
+> machine, so pick a `ttl` that matches how stale the content may get.
+
+## Idle shutdown
+
+```toml
+inactivity_threshold = "1h"
+```
+
+doormouse suspends a machine when both conditions hold:
+
+- No route has seen traffic for `inactivity_threshold`.
+- No forwarded connection is still open.
+
+The second condition matters. An `ssh` session is idle by nature, and a large
+upload can outlast the threshold. Neither should be cut off mid-flight.
+
+Omit the field, or set `"0s"`, to never shut the machine down.
+
+> [!TIP]
+> An open `ssh` session holds the machine awake even while nothing is typed, so a
+> forgotten terminal keeps it up all night. Let `sshd` close idle sessions itself
+> and the threshold can do its job. In `sshd_config` on the target:
+>
+> ```text
+> ChannelTimeout *=10m
+> UnusedConnectionTimeout 1m
+> ```
+>
+> Requires OpenSSH 9.3 or newer.
+
+## Shutdown mechanisms
+
+Configure exactly one per machine.
+
+**Over SSH:**
+
+```toml
+ssh_host = "nas.local:22"
+ssh_user = "doormouse"
+ssh_key_path = "/app/ssh_key"
+shutdown_command = "sudo systemctl suspend"
+```
+
+The key has to be readable by the user doormouse runs as, which in the container
+is UID 1000. doormouse checks the key at startup and warns if it cannot open it,
+because the key itself is only used much later, when the machine goes idle.
+
+**Over HTTP:**
+
+```toml
+shutdown_http_url = "http://nas.local/api/shutdown"
+shutdown_http_method = "POST"   # optional, defaults to POST
+shutdown_http_ok_status = 202   # optional, defaults to any 2xx
+```
+
+## Config validation
+
+doormouse validates the config at startup and refuses to run on a bad one, rather
+than starting and misbehaving later. It rejects:
+
+- **A machine with no `health_check`.** Every check would fail, the machine would
+  look permanently dead, and every request would try to wake it.
+- **A `destination` that cannot work.** TCP routes need `host:port`. HTTP routes
+  need an absolute `http://` or `https://` URL. A schemeless value such as
+  `nas.local:2283` parses as a URL scheme named `nas.local` and would otherwise
+  502 every request with nothing in the logs.
+- **A `health_check` the checker cannot dispatch on.** It must start with
+  `tcp://`, `http://` or `https://`.
+- **Any unrecognised key.** Typos used to decode silently to a zero value, which
+  is the usual route to a missing health check.
+
+> [!CAUTION]
+> The last rule can break an upgrade. A config carrying a key from an older
+> version will now fail to start. Read the error, drop the key, restart.
+
+## Signals
+
+`SIGINT` and `SIGTERM` trigger a graceful shutdown. doormouse stops accepting,
+gives in-flight HTTP requests up to 15 seconds to finish, closes the TCP
+listeners and exits 0. In-flight TCP connections are dropped rather than drained,
+so a forwarded `ssh` session ends when the proxy stops.
+
+## Migrating from `[[targets]]`
+
+Early versions used one `[[targets]]` block per server. That format still loads,
+but it will be removed in a future release.
+
+On startup doormouse translates an old config, logs what it did, and writes the
+result beside the original as `<name>.migrated.toml`. Review that file, then swap
+it in. Your original is never modified, since it is often bind-mounted read-only
+or checked into a config repo.
+
+A config may use one format or the other, never both.
+
+For migration output on the host, create a config directory before starting
+Compose and copy your existing config into it:
 
 ```bash
-docker run --network host \
-  -v /path/to/config.toml:/app/config.toml \
-  -v /path/to/cache:/app/cache \
-  ghcr.io/xbold/go-wol-proxy:latest
+mkdir -p conf
+cp config.toml conf/config.toml
 ```
 
-### Similar projects:
-1. traefik-wol: [traefiklabs](https://plugins.traefik.io/plugins/642498d26d4f66a5a8a59d25/wake-on-lan), [github](https://github.com/MarkusJx/traefik-wol)
-2. caddy-wol: [github](https://github.com/dulli/caddy-wol)
+Mount that directory in place of the single config file:
+
+```yaml
+volumes:
+  - ./conf:/app
+  - ./ssh_key:/app/ssh_key:ro
+```
+
+The directory must be writable and the config readable by the container user.
+If your host UID is 1000, files created by the commands above already have the
+right owner. Otherwise, set `user: "<UID>:<GID>"` on the service, replacing the
+placeholders with `id -u` and `id -g`. Alternatively, use
+`sudo chown 1000:1000 conf conf/config.toml` and ensure the directory has owner
+write permission. The migrated file is mode `0600`, owned by the container UID;
+using your own UID lets you read and replace it without `sudo`.
+
+With the quick-start single-file mount, `/app` is not writable by the container
+user. doormouse logs the complete migrated config instead; retrieve it with
+`docker compose logs doormouse`. The same fallback applies if a mounted config
+directory is read-only or lacks write permission.
+
+## Container images
+
+Every release publishes an image to `ghcr.io/darksworm/doormouse`, built for
+`linux/amd64` and `linux/arm64`. Four tags point at it:
+
+| Tag | Points at |
+| --- | --- |
+| `0.4.1` | that exact release, and never moves |
+| `0.4` | the newest patch in the 0.4 line |
+| `0` | the newest release in the 0.x line |
+| `latest` | the newest release |
+
+`latest` is fine for trying doormouse out. Once it is proxying something you
+care about, pin the exact version or the minor line, so an upgrade happens when
+you choose it.
+
+The image runs as UID 1000, not root, so anything you mount in has to be readable
+by that user. On most Linux hosts you are 1000 already. If not, `chown 1000:1000`
+the file or set `user:` on the service to your own IDs.
+
+Ports below 1024 still work, because the binary carries the
+`CAP_NET_BIND_SERVICE` capability that Docker grants by default. If you drop
+capabilities, keep that one or doormouse will not start.
+
+The file capability cannot grant privileges when `no-new-privileges` is enabled
+(see the [kernel documentation](https://www.kernel.org/doc/html/latest/userspace-api/no_new_privs.html)).
+For that setup, use ports at or above 1024, or arrange for the runtime to grant
+`NET_BIND_SERVICE` to the process before execution. This also applies to
+Kubernetes configurations with
+[`allowPrivilegeEscalation: false`](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/).
+
+Images up to and including 1.0.0 ran as root, so check both of those when you
+upgrade past it.
+
+## Building from source
+
+```bash
+go build -o doormouse .
+go test -race ./...
+```
+
+The [container end-to-end suite](e2e/README.md) checks the release image's
+wake/proxy/SSH-shutdown lifecycle, runtime permissions, and config migration:
+
+```bash
+go -C e2e test -race -count=1 -timeout=5m -v ./...
+```
+
+To build a local container image, only Docker is required:
+
+```bash
+docker build -t doormouse:local .
+```
+
+The multi-stage `Dockerfile` compiles Go inside Docker and packages the binary
+in the same non-root runtime used for releases. No host Go installation is needed.
+With Docker Buildx, `docker buildx bake` also builds and loads `doormouse:local`.
+
+To check both release architectures (amd64 and arm64), configure QEMU/binfmt
+emulation for the runtime image's build steps, then run:
+
+```bash
+docker buildx bake release --set release.output=type=cacheonly
+```
+
+The release workflow uses that same Bake target to publish version, minor,
+major, and `latest` tags to GHCR. The GitHub release stays a draft until the
+images have been pushed successfully.
+
+## Similar projects
+
+- [traefik-wol](https://github.com/MarkusJx/traefik-wol), a Traefik plugin.
+- [caddy-wol](https://github.com/dulli/caddy-wol), a Caddy plugin.
+
+Prefer those if you already run Traefik or Caddy. doormouse runs standalone and
+also forwards raw TCP.
 
 ## Contributing
 
-We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines and commit conventions.
+Pull requests welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and
+commit conventions.
+
+Docs aim for a Flesch-Kincaid grade of 9 or below. Many readers do not speak
+English as a first language, so short sentences and plain phrasing help. Keep
+the technical vocabulary, though: `liveness`, `Host header` and `broadcast
+domain` are shorter and clearer than talking around them.

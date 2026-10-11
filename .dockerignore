@@ -1,29 +1,7 @@
-# Git
-.git
-.gitignore
-
-# GitHub
-.github/
-
-# Docker
-Dockerfile
-.dockerignore
-
-# Build artifacts
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-*.test
-*.out
-
-# IDE files
-.idea/
-.vscode/
-*.swp
-*.swo
-
-# Misc
-README.md
-LICENSE
+# Only application source and module metadata belong in the build context.
+**
+!Dockerfile
+!go.mod
+!go.sum
+!*.go
+*_test.go

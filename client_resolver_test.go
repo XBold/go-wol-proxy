@@ -95,61 +95,57 @@ func TestClientResolverDifferentIPsAreIndependent(t *testing.T) {
 	}
 }
 
-// --- describeClient ----------------------------------------------------------
+// --- clientAddr --------------------------------------------------------------
 
-func newTestClientProxy(t *testing.T) *ProxyService {
-	t.Helper()
-	backend := newTestBackend(t, false)
-	p, _, _, _, _, _ := setupProxy(t, backend, t.TempDir(), []string{"/docs"}, 100*time.Millisecond)
-	p.clientResolver.enabled = true
-	return p
-}
-
-func TestDescribeClient(t *testing.T) {
-	p := newTestClientProxy(t)
-	p.clientResolver.lookupFn = func(ip string, _ time.Duration) (string, error) {
+func TestClientAddrWithHostname(t *testing.T) {
+	tp := newTestProxy(t, nil)
+	tp.svc.clientResolver = newClientResolver(true)
+	tp.svc.clientResolver.lookupFn = func(ip string, _ time.Duration) (string, error) {
 		if ip == "172.23.0.3" {
-			return "open-webui", nil
+			return "open-webui.", nil
 		}
 		return "", errors.New("no PTR record")
 	}
 
-	req := httptest.NewRequest("POST", "http://192.168.50.80:9100/v1/chat/completions", nil)
+	req := httptest.NewRequest("GET", "/api/server/ping", nil)
 	req.RemoteAddr = "172.23.0.3:57648"
-	req.Host = "192.168.50.80:9100"
-	req.Header.Set("User-Agent", "openai-python/1.59.3")
-	req.Header.Set("X-Forwarded-For", "192.168.50.15")
 
-	desc := p.describeClient(req)
-	for _, want := range []string{
-		"client: 172.23.0.3:57648",
-		"hostname: open-webui",
-		`user-agent: "openai-python/1.59.3"`,
-		"x-forwarded-for: 192.168.50.15",
-	} {
-		if !strings.Contains(desc, want) {
-			t.Errorf("describeClient = %q, missing %q", desc, want)
-		}
-	}
-	for _, absent := range []string{"x-real-ip", "x-forwarded-host"} {
-		if strings.Contains(desc, absent) {
-			t.Errorf("describeClient = %q, should not contain %q", desc, absent)
-		}
+	if got := tp.svc.clientAddr(req); got != "172.23.0.3:57648 (hostname: open-webui)" {
+		t.Errorf("clientAddr = %q", got)
 	}
 }
 
-func TestDescribeClientUnresolvableAndNoHeaders(t *testing.T) {
-	p := newTestClientProxy(t)
-	p.clientResolver.lookupFn = func(ip string, _ time.Duration) (string, error) {
+func TestClientAddrUnresolvableAndForwarded(t *testing.T) {
+	tp := newTestProxy(t, nil)
+	tp.svc.clientResolver = newClientResolver(true)
+	tp.svc.clientResolver.lookupFn = func(ip string, _ time.Duration) (string, error) {
 		return "", errors.New("no PTR record")
 	}
 
-	req := httptest.NewRequest("GET", "http://192.168.50.80:9100/health", nil)
+	req := httptest.NewRequest("GET", "/api/server/ping", nil)
 	req.RemoteAddr = "203.0.113.7:1234"
+	if got := tp.svc.clientAddr(req); got != "203.0.113.7:1234" {
+		t.Errorf("clientAddr = %q", got)
+	}
 
-	desc := p.describeClient(req)
-	if desc != "client: 203.0.113.7:1234" {
-		t.Fatalf("describeClient = %q, want only the client address", desc)
+	req.Header.Set("X-Forwarded-For", "192.168.50.15")
+	if got := tp.svc.clientAddr(req); got != "203.0.113.7:1234 (forwarded for 192.168.50.15)" {
+		t.Errorf("clientAddr = %q", got)
+	}
+}
+
+func TestClientAddrLookupDisabled(t *testing.T) {
+	tp := newTestProxy(t, nil)
+	tp.svc.clientResolver = newClientResolver(false)
+	tp.svc.clientResolver.lookupFn = func(ip string, _ time.Duration) (string, error) {
+		t.Fatal("lookup must not run when the resolver is disabled")
+		return "", nil
+	}
+
+	req := httptest.NewRequest("GET", "/api/server/ping", nil)
+	req.RemoteAddr = "172.23.0.3:57648"
+	if got := tp.svc.clientAddr(req); got != "172.23.0.3:57648" {
+		t.Errorf("clientAddr = %q", got)
 	}
 }
 
@@ -162,5 +158,27 @@ func TestClientIP(t *testing.T) {
 	}
 	if got := clientIP("garbage"); got != "garbage" {
 		t.Fatalf("clientIP = %q, want garbage (passthrough)", got)
+	}
+}
+
+// --- config -----------------------------------------------------------------
+
+func TestLoadConfigClientHostnameLookup(t *testing.T) {
+	cfg, err := LoadConfig(writeTempConfig(t, machinesRoutesConfig), RealClock{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.ClientHostnameLookup {
+		t.Error("client_hostname_lookup must default to true when absent")
+	}
+
+	// The key must sit in the top-level section, before any [[machines]] table.
+	disabled := "client_hostname_lookup = false\n" + strings.TrimLeft(machinesRoutesConfig, "\n")
+	cfg, err = LoadConfig(writeTempConfig(t, disabled), RealClock{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ClientHostnameLookup {
+		t.Error("client_hostname_lookup = false must disable the lookup")
 	}
 }

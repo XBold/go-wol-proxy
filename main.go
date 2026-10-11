@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -16,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -26,50 +28,10 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// Log levels
-type LogLevel int
-
-const (
-	LogLevelDebug LogLevel = iota
-	LogLevelInfo
-	LogLevelWarn
-	LogLevelError
-)
-
-func ParseLogLevel(s string) LogLevel {
-	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "debug", "dbg":
-		return LogLevelDebug
-	case "warn", "warning":
-		return LogLevelWarn
-	case "error", "err":
-		return LogLevelError
-	case "info", "inf", "":
-		return LogLevelInfo
-	default:
-		return LogLevelInfo
-	}
-}
-
-func (l LogLevel) String() string {
-	switch l {
-	case LogLevelDebug:
-		return "debug"
-	case LogLevelInfo:
-		return "info"
-	case LogLevelWarn:
-		return "warn"
-	case LogLevelError:
-		return "error"
-	default:
-		return "info"
-	}
-}
-
 // Interfaces for dependency injection
 type HealthChecker interface {
 	Check(ctx context.Context, endpoint string, source string) bool
-	StartBackgroundChecks(ctx context.Context, targets map[string]*TargetState, interval time.Duration)
+	StartBackgroundChecks(ctx context.Context, machines map[string]*Machine, routes []*Route, interval time.Duration)
 	WaitForInitialChecks(ctx context.Context) error
 	CloseIdleConnections()
 }
@@ -79,7 +41,7 @@ type WOLSender interface {
 }
 
 type SSHExecutor interface {
-	ExecuteCommand(host, user, keyPath, knownHosts, command string) error
+	ExecuteCommand(host, user, keyPath, command string) error
 }
 
 type Logger interface {
@@ -88,76 +50,217 @@ type Logger interface {
 	Debug(msg string, args ...interface{})
 }
 
+const tcpScheme = "tcp://"
+
+// version is replaced by the release build. Keep a useful value for local
+// builds and tests that do not supply linker flags.
+var version = "dev"
+
+// shutdownGrace is how long in-flight requests get to finish on shutdown.
+const shutdownGrace = 15 * time.Second
+
+// healthCheckTimeout caps a single health check, HTTP or TCP alike. The TCP cap has
+// to live on the dialer rather than relying on the caller's context: waitForWake and
+// markReadyIfHealthy pass their caller's context through undeadlined, and a dropped
+// SYN would otherwise block for the kernel's whole retry schedule.
+const healthCheckTimeout = 5 * time.Second
+
+// A retried accept backs off between attempts, so a listener that is failing for a
+// reason we cannot fix does not spin a core while it recovers.
+const (
+	acceptRetryDelayMin = 5 * time.Millisecond
+	acceptRetryDelayMax = 1 * time.Second
+)
+
+// isTemporaryAcceptError reports whether an Accept failure is worth retrying. These
+// are conditions a listener recovers from unaided: a client that reset during the
+// handshake, or the process briefly out of descriptors or buffers. Anything else
+// means the listener is broken, and that has to reach the operator rather than
+// becoming a silent retry loop.
+func isTemporaryAcceptError(err error) bool {
+	return errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.EMFILE) ||
+		errors.Is(err, syscall.ENFILE) ||
+		errors.Is(err, syscall.ENOBUFS) ||
+		errors.Is(err, syscall.ENOMEM)
+}
+
+type Ticker interface {
+	C() <-chan time.Time
+	Stop()
+}
+
+type Clock interface {
+	Now() time.Time
+	NewTicker(d time.Duration) Ticker
+	After(d time.Duration) <-chan time.Time
+}
+
+type RealClock struct{}
+
+func (RealClock) Now() time.Time                         { return time.Now() }
+func (RealClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
+func (RealClock) NewTicker(d time.Duration) Ticker       { return &realTicker{time.NewTicker(d)} }
+
+type realTicker struct{ t *time.Ticker }
+
+func (r *realTicker) C() <-chan time.Time { return r.t.C }
+func (r *realTicker) Stop()               { r.t.Stop() }
+
 // Config structs
 type Config struct {
-	Port                  string      `toml:"port"`
-	Timeout               string      `toml:"timeout"`
-	StartupTime           string      `toml:"startup_time"`
-	ResponseHeaderTimeout string      `toml:"response_header_timeout"`
-	ResponseTimeout       string      `toml:"response_timeout"`
-	RequestTimeout        string      `toml:"request_timeout"`
-	HealthCheckInterval   string      `toml:"health_check_interval"`
-	HealthCacheDuration   string      `toml:"health_cache_duration"`
-	SSLCertificate        string      `toml:"ssl_certificate"`
-	SSLCertificateKey     string      `toml:"ssl_certificate_key"`
-	LogLevel              string      `toml:"log_level"`
-	ClientHostnameLookup  *bool       `toml:"client_hostname_lookup"`
-	Targets               []Target    `toml:"targets"`
-	CacheConfig           CacheConfig `toml:"cache"`
+	Port                  string         `toml:"port"`
+	Timeout               string         `toml:"timeout"`
+	StartupTime           string         `toml:"startup_time,omitempty"`
+	RequestHeaderTimeout  string         `toml:"request_header_timeout,omitempty"`
+	ResponseHeaderTimeout string         `toml:"response_header_timeout,omitempty"`
+	ServerReadTimeout     string         `toml:"server_read_timeout,omitempty"`
+	ServerWriteTimeout    string         `toml:"server_write_timeout,omitempty"`
+	ServerIdleTimeout     string         `toml:"server_idle_timeout,omitempty"`
+	ClientHostnameLookup  *bool          `toml:"client_hostname_lookup,omitempty"`
+	PollInterval          string         `toml:"poll_interval"`
+	HealthCheckInterval   string         `toml:"health_check_interval"`
+	HealthCacheDuration   string         `toml:"health_cache_duration"`
+	SSLCertificate        string         `toml:"ssl_certificate,omitempty"`
+	SSLCertificateKey     string         `toml:"ssl_certificate_key,omitempty"`
+	CacheConfig           CacheConfig    `toml:"cache,omitempty"`
+	Targets               []Target       `toml:"targets,omitempty"` // legacy, superseded by machines + routes
+	Machines              []MachineEntry `toml:"machines,omitempty"`
+	Routes                []RouteEntry   `toml:"routes,omitempty"`
+}
+
+// MachineEntry is a [[machines]] block as written in the config file.
+type MachineEntry struct {
+	Name                    string `toml:"name"`
+	MacAddress              string `toml:"mac_address,omitempty"`
+	BroadcastIP             string `toml:"broadcast_ip,omitempty"`
+	WolPort                 int    `toml:"wol_port,omitempty"`
+	WolBurstCount           int    `toml:"wol_burst_count,omitempty"`
+	WakeTimeout             string `toml:"wake_timeout,omitempty"`
+	WakeHealthCheckInterval string `toml:"wake_health_check_interval,omitempty"`
+	HealthCheck             string `toml:"health_check,omitempty"`
+	SSHHost                 string `toml:"ssh_host,omitempty"`
+	SSHUser                 string `toml:"ssh_user,omitempty"`
+	SSHKeyPath              string `toml:"ssh_key_path,omitempty"`
+	ShutdownCommand         string `toml:"shutdown_command,omitempty"`
+	ShutdownHTTPUrl         string `toml:"shutdown_http_url,omitempty"`
+	ShutdownHTTPMethod      string `toml:"shutdown_http_method,omitempty"`
+	ShutdownHTTPOKStatus    int    `toml:"shutdown_http_ok_status,omitempty"`
+	InactivityThreshold     string `toml:"inactivity_threshold,omitempty"`
+}
+
+// RouteEntry is a [[routes]] block as written in the config file.
+type RouteEntry struct {
+	Machine     string `toml:"machine"`
+	Hostname    string `toml:"hostname,omitempty"`
+	ListenPort  int    `toml:"listen_port,omitempty"`
+	Destination string `toml:"destination,omitempty"`
+	HealthCheck string `toml:"health_check,omitempty"`
+}
+
+// CacheConfig is the optional [cache] block. When a machine is offline, GET
+// responses for the configured paths are served from disk instead of waking
+// it: the client gets a full answer while the box stays asleep, and the
+// cache is refreshed again once the machine is reachable.
+type CacheConfig struct {
+	Enabled              bool               `toml:"enabled"`
+	RootPath             string             `toml:"root_path,omitempty"`
+	TTL                  string             `toml:"ttl,omitempty"`
+	MaxResponseSizeBytes int64              `toml:"max_response_size_bytes,omitempty"`
+	WarmInterval         string             `toml:"warm_interval,omitempty"`
+	Routes               []CacheRouteConfig `toml:"routes,omitempty"`
+}
+
+// CacheRouteConfig is a [[cache.routes]] block: the paths cached for one route.
+type CacheRouteConfig struct {
+	Route string   `toml:"route"`
+	Paths []string `toml:"paths"`
 }
 
 type Target struct {
-	Name                    string `toml:"name"`
-	Hostname                string `toml:"hostname"`
-	Destination             string `toml:"destination"`
-	HealthEndpoint          string `toml:"health_endpoint"`
-	MacAddress              string `toml:"mac_address"`
-	BroadcastIP             string `toml:"broadcast_ip"`
-	WolPort                 int    `toml:"wol_port"`
-	WOLBurstCount           int    `toml:"wol_burst_count"`
-	WakeTimeout             string `toml:"wake_timeout"`
-	WakeHealthCheckInterval string `toml:"wake_health_check_interval"`
-	SSHHost                 string `toml:"ssh_host"`
-	SSHUser                 string `toml:"ssh_user"`
-	SSHKeyPath              string `toml:"ssh_key_path"`
-	SSHKnownHosts           string `toml:"ssh_known_hosts"`
-	ShutdownCommand         string `toml:"shutdown_command"`
-	ShutdownHTTPUrl         string `toml:"shutdown_http_url"`
-	ShutdownHTTPMethod      string `toml:"shutdown_http_method"`
-	ShutdownHTTPOKStatus    int    `toml:"shutdown_http_ok_status"`
-	InactivityThreshold     string `toml:"inactivity_threshold"`
+	Name                 string `toml:"name"`
+	Hostname             string `toml:"hostname"`
+	Destination          string `toml:"destination"`
+	HealthEndpoint       string `toml:"health_endpoint"`
+	MacAddress           string `toml:"mac_address"`
+	BroadcastIP          string `toml:"broadcast_ip"`
+	WolPort              int    `toml:"wol_port"`
+	SSHHost              string `toml:"ssh_host"`
+	SSHUser              string `toml:"ssh_user"`
+	SSHKeyPath           string `toml:"ssh_key_path"`
+	ShutdownCommand      string `toml:"shutdown_command"`
+	ShutdownHTTPUrl      string `toml:"shutdown_http_url"`
+	ShutdownHTTPMethod   string `toml:"shutdown_http_method"`
+	ShutdownHTTPOKStatus int    `toml:"shutdown_http_ok_status"`
+	InactivityThreshold  string `toml:"inactivity_threshold"`
 }
 
-type CacheConfig struct {
-	Enabled              bool                `toml:"enabled"`
-	RootPath             string              `toml:"root_path"`
-	TTL                  string              `toml:"ttl"`
-	MaxResponseSizeBytes int64               `toml:"max_response_size_bytes"`
-	WarmInterval         string              `toml:"warm_interval"`
-	Targets              []CacheTargetConfig `toml:"targets"`
+// Machine is a host that is woken, health-checked and shut down as one unit,
+// however many routes point at it.
+type MachineConfig struct {
+	MacAddress              string
+	BroadcastIP             string
+	WolPort                 int
+	WolBurstCount           int           // WOL packets per burst (1-10, 0 = default)
+	WakeTimeout             time.Duration // per-machine wake bound (0 = global timeout)
+	WakeHealthCheckInterval time.Duration // fixed wake poll (0 = adaptive halving)
+	HealthCheck             string
+	SSHHost                 string
+	SSHUser                 string
+	SSHKeyPath              string
+	ShutdownCommand         string
+	ShutdownHTTPUrl         string
+	ShutdownHTTPMethod      string
+	ShutdownHTTPOKStatus    int
+	InactivityThreshold     time.Duration
 }
 
-type CacheTargetConfig struct {
-	Target string   `toml:"target"`
-	Paths  []string `toml:"paths"`
+// Route is one way in to a machine.
+type Route struct {
+	Name        string
+	Machine     *Machine
+	Hostname    string
+	ListenPort  int
+	Destination string
+	// HealthCheck is this route's readiness check: can this route serve? It is
+	// distinct from the machine's liveness check, which answers whether the box is
+	// up at all. Defaults to dialing Destination.
+	HealthCheck string
+
+	IsReady   bool
+	LastCheck time.Time
+	mu        sync.RWMutex
+}
+
+// IsTCP reports whether this route is reached by its own listening socket rather
+// than by Host header. A route has a hostname or a listen port, never both.
+func (r *Route) IsTCP() bool { return r.ListenPort != 0 }
+
+// routing is the runtime routing model: machines and the routes that reach them.
+type routing struct {
+	machines     map[string]*Machine
+	routes       []*Route
+	byHostname   map[string]*Route
+	byListenPort map[int]*Route
 }
 
 type ProxyConfig struct {
 	Port                  string
 	Timeout               time.Duration
 	StartupTime           time.Duration
+	RequestHeaderTimeout  time.Duration
 	ResponseHeaderTimeout time.Duration
-	ResponseTimeout       time.Duration
-	RequestTimeout        time.Duration
+	ServerReadTimeout     time.Duration
+	ServerWriteTimeout    time.Duration
+	ServerIdleTimeout     time.Duration
+	ClientHostnameLookup  bool
+	PollInterval          time.Duration
 	HealthCheckInterval   time.Duration
 	HealthCacheDuration   time.Duration
-	LogLevel              string
-	ClientHostnameLookup  bool
-	Targets               map[string]*TargetState
-	HostnameMap           map[string]string        // hostname -> target name
-	InactivityThresholds  map[string]time.Duration // target name -> inactivity threshold
-	WakeTimeouts          map[string]time.Duration // target name -> wake timeout (unset -> global Timeout)
-	WakeCheckIntervals    map[string]time.Duration // target name -> fixed health check interval during wake (unset -> adaptive)
+	Machines              map[string]*Machine
+	Routes                []*Route
+	RoutesByHostname      map[string]*Route
+	RoutesByListenPort    map[int]*Route
 	SSLCertificate        string
 	SSLCertificateKey     string
 	CacheEnabled          bool
@@ -165,17 +268,19 @@ type ProxyConfig struct {
 	CacheTTL              time.Duration
 	CacheMaxResponseSize  int64
 	CacheWarmInterval     time.Duration
-	CachePaths            map[string][]string // target name -> list of cached paths
+	CacheRoutes           map[string][]string // route name -> cached path patterns
 }
 
-type TargetState struct {
-	Target       *Target
+type Machine struct {
+	Name         string
+	Config       *MachineConfig
 	IsHealthy    bool
 	LastCheck    time.Time
 	IsWaking     bool
 	wakeGen      int       // monotonically increasing generation counter for wake operations
 	wake         *wakeInfo // in-flight (or most recently completed) wake generation
 	LastActivity time.Time
+	openConns    int
 	mu           sync.RWMutex
 }
 
@@ -190,6 +295,39 @@ type wakeInfo struct {
 	err  error
 }
 
+// openConnections reports how many forwarded connections are currently open. A
+// long-lived idle connection — an ssh session is the motivating case — moves no
+// bytes, so LastActivity alone cannot tell the machine is still in use.
+func (m *Machine) openConnections() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.openConns
+}
+
+func (m *Machine) holdConnection() {
+	m.mu.Lock()
+	m.openConns++
+	m.mu.Unlock()
+}
+
+// releaseConnection decrements the in-flight counter and stamps LastActivity to
+// now. Stamping on release is what makes the inactivity countdown start at
+// disconnect: a long-running session — an ssh login left open for hours — would
+// otherwise carry a stale LastActivity from when it began, and the very next
+// inactivity tick after logout would exceed the threshold and shut the box down.
+func (m *Machine) releaseConnection(now time.Time) {
+	m.mu.Lock()
+	if m.openConns > 0 {
+		m.openConns--
+	}
+	m.LastActivity = now
+	m.mu.Unlock()
+}
+
+// ---------------------------------------------------------------------------
+// Static response cache
+// ---------------------------------------------------------------------------
+
 type cacheEntry struct {
 	StatusCode int                 `json:"status_code"`
 	Headers    map[string][]string `json:"headers"`
@@ -198,6 +336,8 @@ type cacheEntry struct {
 	Path       string              `json:"path"`
 }
 
+// CacheStore persists GET responses for configured route paths on disk so
+// they can be served while the machine behind the route is asleep.
 type CacheStore struct {
 	rootPath    string
 	ttl         time.Duration
@@ -205,23 +345,23 @@ type CacheStore struct {
 	logger      Logger
 	entriesMu   sync.RWMutex
 	entries     map[string]*cacheEntry
-	targetPaths map[string][]string // target name -> list of patterns
-	keyToTarget map[string]string   // cache key -> target name
+	routePaths  map[string][]string // route name -> list of patterns
+	keyToRoute  map[string]string   // cache key -> route name
 	keyToPath   map[string]string   // cache key -> path
 	accessOrder []string
 	maxEntries  int
 	lastHashes  map[string][]byte // cache key -> last SHA-256 hash of body
 }
 
-func NewCacheStore(rootPath string, ttl time.Duration, maxSize int64, targetPaths map[string][]string, logger Logger) *CacheStore {
+func NewCacheStore(rootPath string, ttl time.Duration, maxSize int64, routePaths map[string][]string, logger Logger) *CacheStore {
 	cs := &CacheStore{
 		rootPath:    rootPath,
 		ttl:         ttl,
 		maxSize:     maxSize,
 		logger:      logger,
 		entries:     make(map[string]*cacheEntry),
-		targetPaths: targetPaths,
-		keyToTarget: make(map[string]string),
+		routePaths:  routePaths,
+		keyToRoute:  make(map[string]string),
 		keyToPath:   make(map[string]string),
 		accessOrder: []string{},
 		maxEntries:  1000,
@@ -237,22 +377,26 @@ func NewCacheStore(rootPath string, ttl time.Duration, maxSize int64, targetPath
 	return cs
 }
 
-func (cs *CacheStore) key(targetName, path string) string {
-	hash := sha256.Sum256([]byte(targetName + path))
+func (cs *CacheStore) key(routeName, urlPath string) string {
+	hash := sha256.Sum256([]byte(routeName + urlPath))
 	return fmt.Sprintf("%x", hash[:16])
 }
 
-func (cs *CacheStore) cacheFilePath(targetName, path string) string {
-	return filepath.Join(cs.rootPath, targetName, cs.key(targetName, path)+".cache")
+func (cs *CacheStore) cacheFilePath(routeName, urlPath string) string {
+	return filepath.Join(cs.rootPath, routeName, cs.key(routeName, urlPath)+".cache")
 }
 
-func (cs *CacheStore) load(targetName, path string) (*cacheEntry, bool) {
-	path = filepath.Clean(path)
-	if path == "." || path == "" {
+func (cs *CacheStore) load(routeName, urlPath string) (*cacheEntry, bool) {
+	// urlPath is a URL path: always slash-separated, so clean it with
+	// path.Clean rather than filepath.Clean, which would rewrite separators
+	// on Windows and desynchronize keys from the request paths that produced
+	// them.
+	urlPath = path.Clean(urlPath)
+	if urlPath == "." || urlPath == "" {
 		return nil, false
 	}
 
-	cacheFile := cs.cacheFilePath(targetName, path)
+	cacheFile := cs.cacheFilePath(routeName, urlPath)
 
 	data, err := os.ReadFile(cacheFile)
 	if err != nil {
@@ -260,7 +404,7 @@ func (cs *CacheStore) load(targetName, path string) (*cacheEntry, bool) {
 	}
 
 	var entry cacheEntry
-	if meta, body, ok := parseCacheEnvelope(data); ok && meta.Path == path {
+	if meta, body, ok := parseCacheEnvelope(data); ok && meta.Path == urlPath {
 		entry = meta
 		entry.Body = body
 	} else {
@@ -282,11 +426,11 @@ func (cs *CacheStore) load(targetName, path string) (*cacheEntry, bool) {
 	}
 
 	cs.entriesMu.Lock()
-	k := cs.key(targetName, path)
+	k := cs.key(routeName, urlPath)
 	if _, exists := cs.entries[k]; !exists {
 		cs.entries[k] = &entry
-		cs.keyToTarget[k] = targetName
-		cs.keyToPath[k] = path
+		cs.keyToRoute[k] = routeName
+		cs.keyToPath[k] = urlPath
 		cs.addToAccessOrder(k)
 	}
 	cs.entriesMu.Unlock()
@@ -294,22 +438,22 @@ func (cs *CacheStore) load(targetName, path string) (*cacheEntry, bool) {
 	return &entry, true
 }
 
-func (cs *CacheStore) Save(targetName, path string, statusCode int, headers http.Header, body []byte) {
-	path = filepath.Clean(path)
-	if path == "." || path == "" {
+func (cs *CacheStore) Save(routeName, urlPath string, statusCode int, headers http.Header, body []byte) {
+	urlPath = path.Clean(urlPath)
+	if urlPath == "." || urlPath == "" {
 		return
 	}
 
 	if int64(len(body)) > cs.maxSize {
-		cs.logger.Error("Response too large for cache (%d bytes) for %s %s", len(body), targetName, path)
+		cs.logger.Error("Response too large for cache (%d bytes) for %s %s", len(body), routeName, urlPath)
 		return
 	}
 
 	bodyHash := sha256.Sum256(body)
-	cacheFile := cs.cacheFilePath(targetName, path)
+	cacheFile := cs.cacheFilePath(routeName, urlPath)
 
 	cs.entriesMu.Lock()
-	k := cs.key(targetName, path)
+	k := cs.key(routeName, urlPath)
 	if lastHash, exists := cs.lastHashes[k]; exists && bytes.Equal(lastHash, bodyHash[:]) {
 		// Unchanged content only allows skipping the write while the cache
 		// file is still on disk: the file can disappear independently of
@@ -319,13 +463,13 @@ func (cs *CacheStore) Save(targetName, path string, statusCode int, headers http
 		// every offline request.
 		if _, err := os.Stat(cacheFile); err == nil {
 			cs.entriesMu.Unlock()
-			cs.logger.Debug("Cache unchanged for %s %s, skipping write", targetName, path)
+			cs.logger.Debug("Cache unchanged for %s %s, skipping write", routeName, urlPath)
 			return
 		}
 	}
 	cs.entriesMu.Unlock()
 
-	cacheDir := filepath.Join(cs.rootPath, targetName)
+	cacheDir := filepath.Join(cs.rootPath, routeName)
 	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		cs.logger.Error("Failed to create cache directory %s: %v", cacheDir, err)
 		return
@@ -336,7 +480,7 @@ func (cs *CacheStore) Save(targetName, path string, statusCode int, headers http
 		Headers:    sanitizeCachedHeaders(headers),
 		Body:       body,
 		Timestamp:  time.Now(),
-		Path:       path,
+		Path:       urlPath,
 	}
 
 	// The on-disk entry is a single file:
@@ -368,13 +512,13 @@ func (cs *CacheStore) Save(targetName, path string, statusCode int, headers http
 
 	cs.entriesMu.Lock()
 	cs.entries[k] = meta
-	cs.keyToTarget[k] = targetName
-	cs.keyToPath[k] = path
+	cs.keyToRoute[k] = routeName
+	cs.keyToPath[k] = urlPath
 	cs.addToAccessOrder(k)
 	cs.lastHashes[k] = bodyHash[:]
 	cs.entriesMu.Unlock()
 
-	cs.logger.Info("Cache updated for %s %s", targetName, path)
+	cs.logger.Info("Cache updated for %s %s", routeName, urlPath)
 }
 
 // hopByHopHeaders are connection-specific or framing headers that must not be
@@ -437,20 +581,20 @@ func parseCacheEnvelope(data []byte) (meta cacheEntry, body []byte, ok bool) {
 
 // writeFileAtomic writes data to a temp file in the same directory and renames
 // it into place, so readers never see a partially written file.
-func writeFileAtomic(path string, data []byte) error {
-	tmpFile := path + ".tmp"
+func writeFileAtomic(filePath string, data []byte) error {
+	tmpFile := filePath + ".tmp"
 	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpFile, path); err != nil {
+	if err := os.Rename(tmpFile, filePath); err != nil {
 		os.Remove(tmpFile)
 		return err
 	}
 	return nil
 }
 
-func (cs *CacheStore) Get(targetName, path string) (*http.Response, bool) {
-	entry, ok := cs.load(targetName, path)
+func (cs *CacheStore) Get(routeName, urlPath string) (*http.Response, bool) {
+	entry, ok := cs.load(routeName, urlPath)
 	if !ok {
 		return nil, false
 	}
@@ -468,21 +612,21 @@ func (cs *CacheStore) Get(targetName, path string) (*http.Response, bool) {
 	return resp, true
 }
 
-func (cs *CacheStore) GetCachedPathsForTarget(targetName string) []string {
+func (cs *CacheStore) GetCachedPathsForRoute(routeName string) []string {
 	cs.entriesMu.RLock()
 	defer cs.entriesMu.RUnlock()
 
-	targetPaths, exists := cs.targetPaths[targetName]
-	if !exists || len(targetPaths) == 0 {
+	routePaths, exists := cs.routePaths[routeName]
+	if !exists || len(routePaths) == 0 {
 		return nil
 	}
 
 	var result []string
-	for _, pattern := range targetPaths {
+	for _, pattern := range routePaths {
 		if strings.HasSuffix(pattern, "/*") {
 			prefix := strings.TrimSuffix(pattern, "/*")
 			for key := range cs.keyToPath {
-				if cs.keyToTarget[key] == targetName {
+				if cs.keyToRoute[key] == routeName {
 					if p := cs.keyToPath[key]; p != "" && strings.HasPrefix(p, prefix) {
 						result = append(result, p)
 					}
@@ -494,32 +638,6 @@ func (cs *CacheStore) GetCachedPathsForTarget(targetName string) []string {
 	}
 
 	return result
-}
-
-func (cs *CacheStore) InvalidateTarget(targetName string) {
-	cs.entriesMu.Lock()
-	defer cs.entriesMu.Unlock()
-
-	keysToRemove := []string{}
-	for k, t := range cs.keyToTarget {
-		if t == targetName {
-			keysToRemove = append(keysToRemove, k)
-		}
-	}
-
-	for _, k := range keysToRemove {
-		delete(cs.entries, k)
-		delete(cs.keyToTarget, k)
-		delete(cs.keyToPath, k)
-		delete(cs.lastHashes, k)
-	}
-
-	cacheDir := filepath.Join(cs.rootPath, targetName)
-	if err := os.RemoveAll(cacheDir); err != nil {
-		cs.logger.Error("Failed to remove cache directory %s: %v", cacheDir, err)
-	}
-
-	cs.logger.Info("Cache invalidated for target: %s (removed %d entries)", targetName, len(keysToRemove))
 }
 
 func (cs *CacheStore) addToAccessOrder(key string) {
@@ -534,19 +652,19 @@ func (cs *CacheStore) addToAccessOrder(key string) {
 		oldest := cs.accessOrder[0]
 		cs.accessOrder = cs.accessOrder[1:]
 		delete(cs.entries, oldest)
-		delete(cs.keyToTarget, oldest)
+		delete(cs.keyToRoute, oldest)
 		delete(cs.keyToPath, oldest)
 	}
 }
 
 func (cs *CacheStore) loadAll() {
-	targets := make(map[string]bool)
-	for targetName := range cs.targetPaths {
-		targets[targetName] = true
+	routes := make(map[string]bool)
+	for routeName := range cs.routePaths {
+		routes[routeName] = true
 	}
 
-	for targetName := range targets {
-		dir := filepath.Join(cs.rootPath, targetName)
+	for routeName := range routes {
+		dir := filepath.Join(cs.rootPath, routeName)
 		files, err := os.ReadDir(dir)
 		if err != nil {
 			continue
@@ -597,7 +715,7 @@ func (cs *CacheStore) loadAll() {
 
 			k := file.Name()[:len(file.Name())-len(".cache")]
 			cs.entries[k] = &entry
-			cs.keyToTarget[k] = targetName
+			cs.keyToRoute[k] = routeName
 			cs.keyToPath[k] = entry.Path
 			cs.addToAccessOrder(k)
 		}
@@ -619,17 +737,17 @@ func (cs *CacheStore) Cleanup() {
 	}
 
 	for _, k := range keysToRemove {
-		targetName := cs.keyToTarget[k]
-		path := cs.keyToPath[k]
+		routeName := cs.keyToRoute[k]
+		urlPath := cs.keyToPath[k]
 
 		delete(cs.entries, k)
-		delete(cs.keyToTarget, k)
+		delete(cs.keyToRoute, k)
 		delete(cs.keyToPath, k)
 		delete(cs.lastHashes, k)
 
 		// Also remove the expired files from disk, not just the in-memory bookkeeping.
-		if targetName != "" && path != "" {
-			cacheFile := cs.cacheFilePath(targetName, path)
+		if routeName != "" && urlPath != "" {
+			cacheFile := cs.cacheFilePath(routeName, urlPath)
 			os.Remove(cacheFile)
 			os.Remove(cacheFile + ".meta")
 		}
@@ -644,65 +762,114 @@ func (cs *CacheStore) Close() {
 	cs.Cleanup()
 }
 
-// HTTP Health Checker implementation
-type HTTPHealthChecker struct {
+// catchingBody tees the proxied response body into a buffer and hands the
+// complete copy to onDone when the body is closed, so the cache is written
+// without buffering the whole response in front of the client.
+type catchingBody struct {
+	io.Reader
+	original io.ReadCloser
+	onDone   func()
+	closed   bool
+}
+
+func (cb *catchingBody) Close() error {
+	if cb.closed {
+		return nil
+	}
+	cb.closed = true
+
+	if cb.onDone != nil {
+		cb.onDone()
+	}
+	if cb.original != nil {
+		return cb.original.Close()
+	}
+	return nil
+}
+
+// Health checker: dispatches on the endpoint scheme — tcp:// dials, anything else is an HTTP GET
+type EndpointHealthChecker struct {
 	client           *http.Client
 	logger           Logger
+	dialer           net.Dialer
+	clock            Clock
 	initialCheckDone map[string]bool
 	initialCheckMu   sync.RWMutex
 	initialWaitGroup sync.WaitGroup
 }
 
-func NewHTTPHealthChecker(logger Logger) *HTTPHealthChecker {
+func NewEndpointHealthChecker(logger Logger, clock Clock) *EndpointHealthChecker {
 	transport := &http.Transport{
 		DisableKeepAlives: true,
 	}
-	return &HTTPHealthChecker{
+	return &EndpointHealthChecker{
 		client: &http.Client{
-			Timeout:   5 * time.Second,
+			Timeout:   healthCheckTimeout,
 			Transport: transport,
 		},
+		dialer:           net.Dialer{Timeout: healthCheckTimeout},
 		logger:           logger,
+		clock:            clock,
 		initialCheckDone: make(map[string]bool),
 	}
 }
 
-func (h *HTTPHealthChecker) CloseIdleConnections() {
+func (h *EndpointHealthChecker) CloseIdleConnections() {
 	if transport, ok := h.client.Transport.(*http.Transport); ok {
 		transport.CloseIdleConnections()
 	}
 }
 
-func (h *HTTPHealthChecker) Check(ctx context.Context, endpoint string, source string) bool {
+func (h *EndpointHealthChecker) Check(ctx context.Context, endpoint string, source string) bool {
+	if address, ok := strings.CutPrefix(endpoint, tcpScheme); ok {
+		return h.checkTCP(ctx, address, source)
+	}
+	return h.checkHTTP(ctx, endpoint, source)
+}
+
+// checkTCP reports liveness by opening and immediately closing a connection. For
+// anything that is not an HTTP server — sshd being the motivating case — accepting
+// a connection is the only readiness signal there is.
+func (h *EndpointHealthChecker) checkTCP(ctx context.Context, address string, source string) bool {
+	conn, err := h.dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		h.logger.Info("Health check (%s) failed for %s%s: %v", source, tcpScheme, address, err)
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+func (h *EndpointHealthChecker) checkHTTP(ctx context.Context, endpoint string, source string) bool {
 	req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
 	if err != nil {
-		h.logger.Debug("Health check (%s) failed for %s: %v", source, endpoint, err)
+		h.logger.Info("Health check (%s) failed for %s: %v", source, endpoint, err)
 		return false
 	}
 
 	resp, err := h.client.Do(req)
 	if err != nil {
-		h.logger.Debug("Health check (%s) failed for %s: %v", source, endpoint, err)
+		h.logger.Info("Health check (%s) failed for %s: %v", source, endpoint, err)
 		return false
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		h.logger.Debug("Health check (%s) failed for %s: status %d", source, endpoint, resp.StatusCode)
+		h.logger.Info("Health check (%s) failed for %s: status %d", source, endpoint, resp.StatusCode)
 		return false
 	}
 
 	return true
 }
 
-func (h *HTTPHealthChecker) StartBackgroundChecks(ctx context.Context, targets map[string]*TargetState, interval time.Duration) {
-	for name, target := range targets {
+func (h *EndpointHealthChecker) StartBackgroundChecks(ctx context.Context, machines map[string]*Machine, routes []*Route, interval time.Duration) {
+	for name, machine := range machines {
 		h.initialWaitGroup.Add(1)
-		go h.backgroundCheck(ctx, name, target, interval)
+		go h.backgroundCheck(ctx, name, machine, routesTo(machine, routes), interval)
 	}
 }
 
-func (h *HTTPHealthChecker) WaitForInitialChecks(ctx context.Context) error {
+func (h *EndpointHealthChecker) WaitForInitialChecks(ctx context.Context) error {
 	done := make(chan struct{})
 	go func() {
 		h.initialWaitGroup.Wait()
@@ -717,67 +884,112 @@ func (h *HTTPHealthChecker) WaitForInitialChecks(ctx context.Context) error {
 	}
 }
 
-func (h *HTTPHealthChecker) backgroundCheck(ctx context.Context, name string, target *TargetState, interval time.Duration) {
+func (h *EndpointHealthChecker) backgroundCheck(ctx context.Context, name string, machine *Machine, routes []*Route, interval time.Duration) {
 	// Perform initial check
-	h.performCheck(name, target)
+	h.performCheck(ctx, name, machine, routes)
 	h.markInitialCheckDone(name)
 	h.initialWaitGroup.Done()
 
-	ticker := time.NewTicker(interval)
+	ticker := h.clock.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			h.performCheck(name, target)
+		case <-ticker.C():
+			h.performCheck(ctx, name, machine, routes)
 		}
 	}
 }
 
-func (h *HTTPHealthChecker) performCheck(name string, target *TargetState) {
-	target.mu.RLock()
-	isWaking := target.IsWaking
-	target.mu.RUnlock()
+func (h *EndpointHealthChecker) performCheck(ctx context.Context, name string, machine *Machine, routes []*Route) {
+	machine.mu.RLock()
+	isWaking := machine.IsWaking
+	machine.mu.RUnlock()
 	if isWaking {
-		h.logger.Debug("Background health check for %s (%s) running while wake is in progress",
-			name, target.Target.Hostname)
+		h.logger.Info("Background health check for %s (%s) running while wake is in progress",
+			name, machine.Config.HealthCheck)
 	}
 
-	checkStarted := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	checkStarted := h.clock.Now()
+	checkCtx, cancel := context.WithTimeout(ctx, healthCheckTimeout)
 	defer cancel()
 
-	healthy := h.Check(ctx, target.Target.HealthEndpoint, "background")
+	healthy := h.Check(checkCtx, machine.Config.HealthCheck, "background")
 
-	target.mu.Lock()
-	previousHealth := target.IsHealthy
-	target.IsHealthy = healthy
-	target.LastCheck = time.Now()
-	target.mu.Unlock()
+	machine.mu.Lock()
+	previousHealth := machine.IsHealthy
+	machine.IsHealthy = healthy
+	machine.LastCheck = h.clock.Now()
+	machine.mu.Unlock()
 
 	if healthy != previousHealth {
 		status := "DOWN"
 		if healthy {
 			status = "UP"
 		}
-		h.logger.Info("Health check for %s (%s): %s", name, target.Target.Hostname, status)
+		h.logger.Info("Health check for %s (%s): %s", name, machine.Config.HealthCheck, status)
 	}
 
 	if !healthy && previousHealth {
 		h.logger.Info(
 			"Background health check for %s (%s): downgrading healthy to unhealthy (check took %v)",
-			name, target.Target.Hostname, time.Since(checkStarted).Round(time.Millisecond),
+			name, machine.Config.HealthCheck, h.clock.Now().Sub(checkStarted).Round(time.Millisecond),
 		)
 	}
 
 	if !healthy {
 		h.CloseIdleConnections()
 	}
+
+	h.checkRoutes(ctx, machine, routes, healthy)
 }
 
-func (h *HTTPHealthChecker) markInitialCheckDone(name string) {
+// checkRoutes polls each route's readiness, but only while its machine is live. A
+// machine that is meant to be asleep most of the time would otherwise generate a
+// failed connection per route per interval, forever.
+func (h *EndpointHealthChecker) checkRoutes(ctx context.Context, machine *Machine, routes []*Route, machineLive bool) {
+	for _, route := range routes {
+		if !machineLive {
+			route.mu.Lock()
+			route.IsReady = false
+			route.mu.Unlock()
+			continue
+		}
+
+		checkCtx, cancel := context.WithTimeout(ctx, healthCheckTimeout)
+		ready := h.Check(checkCtx, route.HealthCheck, "background")
+		cancel()
+
+		route.mu.Lock()
+		previous := route.IsReady
+		route.IsReady = ready
+		route.LastCheck = h.clock.Now()
+		route.mu.Unlock()
+
+		if ready != previous {
+			status := "NOT READY"
+			if ready {
+				status = "READY"
+			}
+			h.logger.Info("Route %s on machine %s: %s", route.Name, machine.Name, status)
+		}
+	}
+}
+
+// routesTo returns the routes that reach the given machine.
+func routesTo(machine *Machine, routes []*Route) []*Route {
+	matched := make([]*Route, 0, len(routes))
+	for _, route := range routes {
+		if route.Machine == machine {
+			matched = append(matched, route)
+		}
+	}
+	return matched
+}
+
+func (h *EndpointHealthChecker) markInitialCheckDone(name string) {
 	h.initialCheckMu.Lock()
 	defer h.initialCheckMu.Unlock()
 	h.initialCheckDone[name] = true
@@ -801,7 +1013,7 @@ func NewDefaultSSHExecutor(logger Logger) *DefaultSSHExecutor {
 	return &DefaultSSHExecutor{logger: logger}
 }
 
-func (s *DefaultSSHExecutor) ExecuteCommand(host, user, keyPath, knownHosts, command string) error {
+func (s *DefaultSSHExecutor) ExecuteCommand(host, user, keyPath, command string) error {
 	// Read private key
 	key, err := os.ReadFile(keyPath)
 	if err != nil {
@@ -814,24 +1026,13 @@ func (s *DefaultSSHExecutor) ExecuteCommand(host, user, keyPath, knownHosts, com
 		return fmt.Errorf("unable to parse private key: %w", err)
 	}
 
-	// Configure host key callback
-	var hostKeyCallback ssh.HostKeyCallback
-	if knownHosts != "" {
-		hostKeyCallback, err = newKnownHostsCallback(knownHosts)
-		if err != nil {
-			return fmt.Errorf("failed to create known_hosts callback: %w", err)
-		}
-	} else {
-		hostKeyCallback = ssh.InsecureIgnoreHostKey()
-	}
-
 	// Configure SSH client
 	config := &ssh.ClientConfig{
 		User: user,
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(signer),
 		},
-		HostKeyCallback: hostKeyCallback,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         10 * time.Second,
 	}
 
@@ -858,49 +1059,6 @@ func (s *DefaultSSHExecutor) ExecuteCommand(host, user, keyPath, knownHosts, com
 
 	s.logger.Info("SSH command executed successfully on %s@%s, output: %s", user, host, string(output))
 	return nil
-}
-
-func newKnownHostsCallback(filename string) (ssh.HostKeyCallback, error) {
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return nil, fmt.Errorf("unable to read known_hosts file %s: %w", filename, err)
-	}
-
-	knownHosts := make(map[string]ssh.PublicKey)
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		_, hosts, pubKey, _, _, err := ssh.ParseKnownHosts([]byte(line))
-		if err != nil || pubKey == nil {
-			continue
-		}
-		for _, host := range hosts {
-			knownHosts[host] = pubKey
-		}
-	}
-
-	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-		// Try exact hostname match first
-		if storedKey, ok := knownHosts[hostname]; ok {
-			if bytes.Equal(storedKey.Marshal(), key.Marshal()) {
-				return nil
-			}
-			return fmt.Errorf("host key mismatch for %s", hostname)
-		}
-		// Try wildcard pattern matching (e.g., *.example.com)
-		for pattern, storedKey := range knownHosts {
-			if matched, _ := filepath.Match(pattern, hostname); matched {
-				if bytes.Equal(storedKey.Marshal(), key.Marshal()) {
-					return nil
-				}
-				return fmt.Errorf("host key mismatch for %s (matched pattern %s)", hostname, pattern)
-			}
-		}
-		return fmt.Errorf("no known host key found for %s", hostname)
-	}, nil
 }
 
 func (w *UDPWOLSender) SendWOL(macAddr, broadcastIP string, port int) error {
@@ -930,7 +1088,7 @@ func (w *UDPWOLSender) SendWOL(macAddr, broadcastIP string, port int) error {
 		return fmt.Errorf("failed to send WOL packet: %w", err)
 	}
 
-	w.logger.Debug("WOL packet sent to %s via %s:%d", macAddr, broadcastIP, port)
+	w.logger.Info("WOL packet sent to %s via %s:%d", macAddr, broadcastIP, port)
 	return nil
 }
 
@@ -956,10 +1114,10 @@ type ProxyService struct {
 	healthChecker  HealthChecker
 	wolSender      WOLSender
 	sshExecutor    SSHExecutor
-	logger         Logger
 	clientResolver *clientResolver
+	logger         Logger
+	clock          Clock
 	cache          *CacheStore
-	proxyTransport *http.Transport
 }
 
 func NewProxyService(
@@ -968,66 +1126,41 @@ func NewProxyService(
 	wolSender WOLSender,
 	sshExecutor SSHExecutor,
 	logger Logger,
+	clock Clock,
 	cache *CacheStore,
 ) *ProxyService {
-	// A single shared transport is reused across all proxied requests (for all
-	// targets - Go's Transport already pools connections per scheme+host, so one
-	// instance is enough). Creating a fresh *http.Transport per request would mean
-	// no keep-alive connection reuse and, since http.Transport has no finalizer
-	// that closes idle connections when garbage collected, a slow leak of open
-	// sockets under sustained traffic.
-	proxyTransport := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   60 * time.Second, // Increased timeout for slow connections
-			KeepAlive: 60 * time.Second, // Increased keep-alive
-		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       120 * time.Second, // Increased idle timeout
-		TLSHandshakeTimeout:   20 * time.Second,  // Increased TLS handshake timeout
-		ExpectContinueTimeout: 5 * time.Second,   // Increased expect-continue timeout
-		MaxIdleConnsPerHost:   10,
-		// Disable compression to avoid issues with already compressed data
-		DisableCompression:    true,
-		ResponseHeaderTimeout: config.ResponseHeaderTimeout,
-		// No timeout for reading the entire response
-		ReadBufferSize:  1024 * 1024, // 1MB buffer for reading
-		WriteBufferSize: 1024 * 1024, // 1MB buffer for writing
-	}
-
 	return &ProxyService{
 		config:         config,
 		healthChecker:  healthChecker,
 		wolSender:      wolSender,
 		sshExecutor:    sshExecutor,
-		logger:         logger,
 		clientResolver: newClientResolver(config.ClientHostnameLookup),
+		logger:         logger,
+		clock:          clock,
 		cache:          cache,
-		proxyTransport: proxyTransport,
 	}
 }
 
-func (p *ProxyService) shutdownTarget(targetName string) error {
-	targetState, exists := p.config.Targets[targetName]
+func (p *ProxyService) shutdownMachine(machineName string) error {
+	machineState, exists := p.config.Machines[machineName]
 	if !exists {
-		return fmt.Errorf("unknown target: %s", targetName)
+		return fmt.Errorf("unknown machine: %s", machineName)
 	}
 
-	target := targetState.Target
-	if (target.SSHHost == "" || target.SSHUser == "" || target.SSHKeyPath == "" || target.ShutdownCommand == "") && target.ShutdownHTTPUrl == "" {
-		return fmt.Errorf("target %s is missing SSH configuration or shutdown command or shutdown HTTP URL", targetName)
+	cfg := machineState.Config
+	if (cfg.SSHHost == "" || cfg.SSHUser == "" || cfg.SSHKeyPath == "" || cfg.ShutdownCommand == "") && cfg.ShutdownHTTPUrl == "" {
+		return fmt.Errorf("machine %s is missing SSH configuration or shutdown command or shutdown HTTP URL", machineName)
 	}
 
-	p.logger.Info("Shutting down target %s (%s) due to inactivity", targetName, target.Hostname)
-	if target.ShutdownHTTPUrl != "" {
+	p.logger.Info("Shutting down machine %s due to inactivity", machineName)
+	if cfg.ShutdownHTTPUrl != "" {
 		// Attempt to shut down via HTTP request
-		method := target.ShutdownHTTPMethod
+		method := cfg.ShutdownHTTPMethod
 		if method == "" {
 			method = "POST" // Default to POST if not specified
 		}
 
-		req, err := http.NewRequest(method, target.ShutdownHTTPUrl, nil)
+		req, err := http.NewRequest(method, cfg.ShutdownHTTPUrl, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create shutdown request: %w", err)
 		}
@@ -1043,8 +1176,8 @@ func (p *ProxyService) shutdownTarget(targetName string) error {
 		defer resp.Body.Close()
 
 		// Accept any 2xx status by default; allow explicit status override
-		if target.ShutdownHTTPOKStatus != 0 {
-			if resp.StatusCode != target.ShutdownHTTPOKStatus {
+		if cfg.ShutdownHTTPOKStatus != 0 {
+			if resp.StatusCode != cfg.ShutdownHTTPOKStatus {
 				return fmt.Errorf("shutdown request failed with status: %s", resp.Status)
 			}
 		} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -1052,70 +1185,153 @@ func (p *ProxyService) shutdownTarget(targetName string) error {
 		}
 
 	} else {
-		err := p.sshExecutor.ExecuteCommand(target.SSHHost, target.SSHUser, target.SSHKeyPath, target.SSHKnownHosts, target.ShutdownCommand)
+		err := p.sshExecutor.ExecuteCommand(cfg.SSHHost, cfg.SSHUser, cfg.SSHKeyPath, cfg.ShutdownCommand)
 		if err != nil {
-			p.logger.Error("Failed to shut down target %s: %v", targetName, err)
+			p.logger.Error("Failed to shut down machine %s: %v", machineName, err)
 			return err
 		}
 	}
 
-	// Mark the target as unhealthy after shutdown
-	targetState.mu.Lock()
-	targetState.IsHealthy = false
-	targetState.mu.Unlock()
+	// Mark the machine as unhealthy after shutdown
+	machineState.mu.Lock()
+	machineState.IsHealthy = false
+	machineState.mu.Unlock()
 	p.healthChecker.CloseIdleConnections()
-	p.proxyTransport.CloseIdleConnections()
 
-	p.logger.Info("Target %s (%s) has been shut down", targetName, target.Hostname)
+	p.logger.Info("Machine %s has been shut down", machineName)
 	return nil
 }
 
 func (p *ProxyService) startInactivityMonitor(ctx context.Context) {
-	// Check every 10 seconds for inactive targets
-	ticker := time.NewTicker(10 * time.Second)
+	// Check every 10 seconds for inactive machines
+	ticker := p.clock.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			p.checkInactiveTargets()
+		case <-ticker.C():
+			p.checkInactiveMachines()
 		}
 	}
 }
 
-func (p *ProxyService) checkInactiveTargets() {
-	now := time.Now()
+func (p *ProxyService) checkInactiveMachines() {
+	now := p.clock.Now()
 
-	for name, targetState := range p.config.Targets {
-		// Skip targets without inactivity threshold
-		threshold, exists := p.config.InactivityThresholds[name]
-		if !exists {
+	for name, machineState := range p.config.Machines {
+		// Skip machines without inactivity threshold
+		threshold := machineState.Config.InactivityThreshold
+		if threshold == 0 {
 			continue
 		}
 
-		// Skip targets that are not healthy (already down)
-		targetState.mu.RLock()
-		isHealthy := targetState.IsHealthy
-		lastActivity := targetState.LastActivity
-		targetState.mu.RUnlock()
+		// Skip machines that are not healthy (already down)
+		machineState.mu.RLock()
+		isHealthy := machineState.IsHealthy
+		lastActivity := machineState.LastActivity
+		openConns := machineState.openConns
+		machineState.mu.RUnlock()
 
 		if !isHealthy {
 			continue
 		}
 
-		// Check if the target has been inactive for too long
+		if openConns > 0 {
+			continue
+		}
+
+		// Check if the machine has been inactive for too long
 		inactiveDuration := now.Sub(lastActivity)
 		if inactiveDuration > threshold {
-			p.logger.Info("Target %s has been inactive for %v (threshold: %v), shutting down",
+			p.logger.Info("Machine %s has been inactive for %v (threshold: %v), shutting down",
 				name, inactiveDuration.Round(time.Second), threshold)
 
-			if err := p.shutdownTarget(name); err != nil {
-				p.logger.Error("Failed to shut down inactive target %s: %v", name, err)
+			if err := p.shutdownMachine(name); err != nil {
+				p.logger.Error("Failed to shut down inactive machine %s: %v", name, err)
 			}
 		}
 	}
+}
+
+// warmMachine refreshes the cached paths of every HTTP route pointing at
+// machine, fetching each from the route's destination while it is reachable.
+func (p *ProxyService) warmMachine(machine *Machine) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	p.logger.Debug("Starting cache warmup for machine: %s", machine.Name)
+
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          10,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			DisableCompression:    true,
+		},
+	}
+
+	for _, route := range routesTo(machine, p.config.Routes) {
+		if route.IsTCP() {
+			continue
+		}
+
+		cachedPaths := p.cache.GetCachedPathsForRoute(route.Name)
+		if len(cachedPaths) == 0 {
+			continue
+		}
+
+		routeURL, err := url.Parse(route.Destination)
+		if err != nil {
+			continue
+		}
+
+		for _, path := range cachedPaths {
+			select {
+			case <-ctx.Done():
+				p.logger.Debug("Cache warmup cancelled for machine: %s", machine.Name)
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			reqURL := *routeURL
+			reqURL.Path = path
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL.String(), nil)
+			if err != nil {
+				p.logger.Error("Failed to create request for %s %s: %v", machine.Name, path, err)
+				continue
+			}
+
+			resp, err := client.Do(req)
+			if err != nil {
+				p.logger.Error("Failed to warm cache for %s %s: %v", machine.Name, path, err)
+				continue
+			}
+
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				body, err := io.ReadAll(io.LimitReader(resp.Body, p.config.CacheMaxResponseSize))
+				resp.Body.Close()
+
+				if err == nil {
+					p.cache.Save(route.Name, path, resp.StatusCode, resp.Header, body)
+				}
+			} else {
+				resp.Body.Close()
+			}
+		}
+	}
+
+	p.logger.Debug("Cache warmup completed for machine: %s", machine.Name)
 }
 
 func (p *ProxyService) startCacheCleanup(ctx context.Context) {
@@ -1136,12 +1352,12 @@ func (p *ProxyService) startCacheWarming(ctx context.Context) {
 	ticker := time.NewTicker(p.config.CacheWarmInterval)
 	defer ticker.Stop()
 
-	for _, targetState := range p.config.Targets {
-		targetState.mu.RLock()
-		isHealthy := targetState.IsHealthy
-		targetState.mu.RUnlock()
+	for _, machine := range p.config.Machines {
+		machine.mu.RLock()
+		isHealthy := machine.IsHealthy
+		machine.mu.RUnlock()
 		if isHealthy {
-			p.warmCache(targetState.Target.Name)
+			p.warmMachine(machine)
 		}
 	}
 
@@ -1150,13 +1366,13 @@ func (p *ProxyService) startCacheWarming(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			for _, targetState := range p.config.Targets {
-				targetState.mu.RLock()
-				isHealthy := targetState.IsHealthy
-				targetState.mu.RUnlock()
+			for _, machine := range p.config.Machines {
+				machine.mu.RLock()
+				isHealthy := machine.IsHealthy
+				machine.mu.RUnlock()
 
 				if isHealthy {
-					p.warmCache(targetState.Target.Name)
+					p.warmMachine(machine)
 				}
 			}
 		}
@@ -1171,7 +1387,8 @@ func (p *ProxyService) Start(ctx context.Context) error {
 	// Start background health checks
 	p.healthChecker.StartBackgroundChecks(
 		ctx,
-		p.config.Targets,
+		p.config.Machines,
+		p.config.Routes,
 		p.config.HealthCheckInterval,
 	)
 
@@ -1184,21 +1401,47 @@ func (p *ProxyService) Start(ctx context.Context) error {
 	// Start background inactivity monitor
 	go p.startInactivityMonitor(ctx)
 
-	// Start cache background tasks if cache is enabled
-	if p.cache != nil && p.config.CacheEnabled {
+	if p.cache != nil {
 		p.logger.Info("Cache enabled, root path: %s, TTL: %v, warm interval: %v",
 			p.config.CacheRootPath, p.config.CacheTTL, p.config.CacheWarmInterval)
-
 		go p.startCacheCleanup(ctx)
 		go p.startCacheWarming(ctx)
 	}
 
 	p.logger.Info("Initial health checks completed, starting HTTP server")
 
-	// Log configured targets
-	for name, target := range p.config.Targets {
-		p.logger.Info("Configured target: %s -> %s (%s)",
-			target.Target.Hostname, name, target.Target.Destination)
+	// Log configured routes
+	for _, route := range p.config.Routes {
+		p.logger.Info("Configured route: %s -> %s (%s)",
+			route.Name, route.Machine.Name, route.Destination)
+	}
+
+	// A failure in any one server winds down the rest, so that the first real error
+	// is what Start reports rather than whichever goroutine happens to notice the
+	// shutdown first.
+	ctx, cancelServers := context.WithCancel(ctx)
+	defer cancelServers()
+
+	// Bind every TCP route before serving anything, so a port clash is reported at
+	// startup rather than leaving the proxy half up.
+	errs := make(chan error, len(p.config.Routes)+1)
+	servers := 0
+	for _, route := range p.config.Routes {
+		if !route.IsTCP() {
+			continue
+		}
+
+		listener, err := net.Listen("tcp", fmt.Sprintf(":%d", route.ListenPort))
+		if err != nil {
+			return fmt.Errorf("could not listen on port %d for machine %s: %w",
+				route.ListenPort, route.Machine.Name, err)
+		}
+		defer listener.Close()
+
+		servers++
+		go func(listener net.Listener, route *Route) {
+			errs <- p.serveTCPRoute(ctx, listener, route)
+		}(listener, route)
 	}
 
 	// Start HTTP/HTTPS server
@@ -1208,13 +1451,69 @@ func (p *ProxyService) Start(ctx context.Context) error {
 	server := &http.Server{
 		Addr:              p.config.Port,
 		Handler:           mux,
-		ReadTimeout:       p.config.RequestTimeout,
-		WriteTimeout:      p.config.ResponseTimeout,
-		IdleTimeout:       120 * time.Second, // 2 minutes for keep-alive connections
-		ReadHeaderTimeout: 30 * time.Second,
+		ReadTimeout:       p.config.ServerReadTimeout,
+		WriteTimeout:      p.config.ServerWriteTimeout,
+		IdleTimeout:       p.config.ServerIdleTimeout,
+		ReadHeaderTimeout: p.config.RequestHeaderTimeout,
 		MaxHeaderBytes:    1 << 20,
 	}
 
+	httpListener, err := net.Listen("tcp", p.config.Port)
+	if err != nil {
+		return fmt.Errorf("could not listen on %s: %w", p.config.Port, err)
+	}
+
+	servers++
+	go func() { errs <- p.serveHTTP(ctx, server, httpListener) }()
+
+	// Wait for every server, not just the first to finish. serveTCPRoute returns nil
+	// microseconds after cancellation, while serveHTTP is still draining in-flight
+	// requests for up to shutdownGrace; returning on that first nil would cut every
+	// response that the drain exists to protect.
+	var firstErr error
+	for i := 0; i < servers; i++ {
+		if err := <-errs; err != nil && firstErr == nil {
+			firstErr = err
+			cancelServers()
+		}
+	}
+
+	if p.cache != nil {
+		p.cache.Close()
+	}
+	return firstErr
+}
+
+// serveHTTP serves until the context is cancelled, then drains in-flight requests
+// before returning. A clean shutdown is not an error.
+//
+// server.Shutdown closes the listener first, which unblocks server.Serve() with
+// http.ErrServerClosed while Shutdown is still waiting on active handlers.
+// Returning on ErrServerClosed alone would let main exit before the grace window
+// finishes and cut every in-flight response, so wait for the shutdown goroutine
+// too.
+func (p *ProxyService) serveHTTP(ctx context.Context, server *http.Server, listener net.Listener) error {
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		<-ctx.Done()
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			server.Close()
+		}
+	}()
+
+	err := p.serveOn(server, listener)
+	if errors.Is(err, http.ErrServerClosed) {
+		<-shutdownDone
+		return nil
+	}
+	return err
+}
+
+func (p *ProxyService) serveOn(server *http.Server, listener net.Listener) error {
 	if isSecureServer(p.config) {
 		// Use HTTPS when both certificate and key are provided
 		tlsConfig := &tls.Config{
@@ -1228,879 +1527,41 @@ func (p *ProxyService) Start(ctx context.Context) error {
 		tlsConfig.Certificates[0] = cert
 		server.TLSConfig = tlsConfig
 
-		p.logger.Info("HTTPS server listening on %s with SSL certificates", p.config.Port)
-		return p.serveAndWaitForShutdown(ctx, server, func() error {
-			//The files in these methods are ignored since there is already a certificate in the config.
-			return server.ListenAndServeTLS("", "")
-		})
+		p.logger.Info("HTTPS server listening on %s with SSL certificates", listener.Addr())
+		//The files in these methods are ignored since there is already a certificate in the config.
+		return server.ServeTLS(listener, "", "")
 	} else {
-		p.logger.Info("HTTP server listening on %s", p.config.Port)
-		return p.serveAndWaitForShutdown(ctx, server, server.ListenAndServe)
+		p.logger.Info("HTTP server listening on %s", listener.Addr())
+		return server.Serve(listener)
 	}
 }
 
-// serveAndWaitForShutdown runs the HTTP(S) server in the background and blocks until
-// either the server stops on its own (returning its error, if any) or ctx is
-// cancelled (e.g. via SIGINT/SIGTERM), in which case the server is shut down
-// gracefully with a bounded timeout.
-func (p *ProxyService) serveAndWaitForShutdown(ctx context.Context, server *http.Server, serve func() error) error {
-	serverErr := make(chan error, 1)
-	go func() {
-		serverErr <- serve()
-	}()
-
-	select {
-	case err := <-serverErr:
-		if err != nil && err != http.ErrServerClosed {
-			return err
-		}
-		return nil
-	case <-ctx.Done():
-		p.logger.Info("Shutdown signal received, stopping server gracefully...")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			p.logger.Error("Error during server shutdown: %v", err)
-			return err
-		}
-
-		if p.cache != nil {
-			p.cache.Close()
-		}
-		p.proxyTransport.CloseIdleConnections()
-		p.healthChecker.CloseIdleConnections()
-
-		p.logger.Info("Server stopped gracefully")
-		return nil
+// clientAddr describes where a request came from, for the log. RemoteAddr is the
+// peer that actually opened the connection, which is the fronting reverse proxy
+// when there is one, so an X-Forwarded-For it set is reported alongside RemoteAddr
+// rather than in place of it. That header is written by the caller and is only as
+// trustworthy as the hop that wrote it — fine for reading logs, not for decisions.
+// When the network provides PTR records (client_hostname_lookup), the peer's
+// reverse-DNS hostname is reported alongside the address as well.
+func (p *ProxyService) clientAddr(r *http.Request) string {
+	addr := r.RemoteAddr
+	if host, ok := p.clientResolver.resolve(clientIP(addr)); ok {
+		addr = fmt.Sprintf("%s (hostname: %s)", addr, host)
 	}
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		return fmt.Sprintf("%s (forwarded for %s)", addr, forwarded)
+	}
+	return addr
 }
 
-func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
-	targetName := p.extractTarget(r)
-
-	if targetName == "" {
-		p.logger.Error("No target found for hostname: %s (%s)", r.Host, p.describeClient(r))
-		http.Error(w, "No target configured for this hostname", http.StatusNotFound)
-		return
-	}
-
-	clientDesc := p.describeClient(r)
-	p.logger.Info("Incoming request: host: %s -> target: %s, path: %s, method: %s (%s)",
-		r.Host, targetName, r.URL.Path, r.Method, clientDesc)
-
-	targetState, exists := p.config.Targets[targetName]
-	if !exists {
-		p.logger.Error("Unknown target: %s", targetName)
-		http.Error(w, "Target not found", http.StatusNotFound)
-		return
-	}
-
-	// Check if we have fresh health data
-	cached, reason := p.healthCacheStatus(r.Context(), targetName, targetState)
-	if cached {
-		p.logger.Info("Target %s is healthy, proxying immediately", targetName)
-		p.proxyRequest(w, r, targetState.Target)
-		return
-	}
-
-	// Check static cache before triggering WOL
-	if p.cache != nil && p.config.CacheEnabled {
-		if r.Method == "GET" {
-			if resp, ok := p.cache.Get(targetName, r.URL.Path); ok {
-				p.logger.Info("Serving cached response for %s %s (target %s is down)",
-					r.Method, r.URL.Path, targetName)
-				for k, v := range resp.Header {
-					for _, header := range v {
-						w.Header().Add(k, header)
-					}
-				}
-				w.WriteHeader(resp.StatusCode)
-				io.Copy(w, resp.Body)
-				resp.Body.Close()
-				return
-			}
-		}
-	}
-
-	// Need to wake up the server
-	p.logger.Info("Target %s appears down (%s), attempting to wake", targetName, reason)
-	p.healthChecker.CloseIdleConnections()
-	if _, err := p.wakeAndWait(r.Context(), targetState); err != nil {
-		if r.Context().Err() != nil {
-			// The client went away while the wake was pending. The wake itself
-			// runs independently of this request (see wakeAndWait), so the
-			// target will still be confirmed (and the cache refreshed) in the
-			// background; only this client gets no response.
-			p.logger.Info("Client disconnected while waiting for %s to wake: %v (%s)",
-				targetName, err, clientDesc)
-			return
-		}
-		p.logger.Error("Failed to wake target %s: %v", targetName, err)
-		http.Error(w, "Service temporarily unavailable", http.StatusServiceUnavailable)
-		return
-	}
-
-	if err := r.Context().Err(); err != nil {
-		// The wake completed in the background but the client no longer wants
-		// the response. The next request will hit the now-healthy target.
-		p.logger.Info("Client disconnected while %s was waking; aborting request (%s)",
-			targetName, clientDesc)
-		return
-	}
-
-	p.logger.Info("Target %s is now healthy, proxying request", targetName)
-	p.proxyRequest(w, r, targetState.Target)
-}
-
-func (p *ProxyService) extractTarget(r *http.Request) string {
-	// Remove port from host if present
-	host := r.Host
-	if colonIndex := strings.Index(host, ":"); colonIndex != -1 {
-		host = host[:colonIndex]
-	}
-
-	// Look up target by hostname
-	if targetName, exists := p.config.HostnameMap[host]; exists {
-		return targetName
-	}
-
-	return ""
-}
-
-// healthCacheStatus reports whether the target can be treated as healthy
-// right now. If the last background check marked it healthy but that check
-// has aged past health_cache_duration, we don't immediately assume it's
-// down - background checks only run every health_check_interval, so if
-// health_check_interval > health_cache_duration there would otherwise be a
-// recurring window (between the two durations) where a perfectly healthy
-// target is wrongly treated as down and a WOL burst is fired for no reason.
-// Instead we perform a quick synchronous re-check here before giving up.
-func (p *ProxyService) healthCacheStatus(ctx context.Context, targetName string, target *TargetState) (cached bool, reason string) {
-	target.mu.RLock()
-	wasHealthy := target.IsHealthy
-	lastCheck := target.LastCheck
-	target.mu.RUnlock()
-
-	if !wasHealthy {
-		if lastCheck.IsZero() {
-			return false, "no prior health check"
-		}
-		return false, fmt.Sprintf(
-			"marked unhealthy (last check %v ago)",
-			time.Since(lastCheck).Round(time.Second),
-		)
-	}
-
-	age := time.Since(lastCheck)
-	if age <= p.config.HealthCacheDuration {
-		return true, ""
-	}
-
-	// Cached health is stale but the target was healthy as of the last
-	// check. Do an on-demand check (short timeout) instead of assuming down.
-	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	healthy := p.healthChecker.Check(checkCtx, target.Target.HealthEndpoint, "on-demand")
-
-	target.mu.Lock()
-	target.IsHealthy = healthy
-	target.LastCheck = time.Now()
-	target.mu.Unlock()
-
-	if healthy {
-		p.logger.Debug("On-demand health re-check for %s succeeded (stale cache: last check %v ago)",
-			targetName, age.Round(time.Second))
-		return true, ""
-	}
-
-	p.logger.Info("On-demand health re-check for %s failed (last background check %v ago)",
-		targetName, age.Round(time.Second))
-	return false, fmt.Sprintf(
-		"on-demand health check failed (last background check %v ago, cache duration %v)",
-		age.Round(time.Second), p.config.HealthCacheDuration,
-	)
-}
-
-// wakeAndWait makes sure a wake is in flight for the target, then makes the
-// caller wait for its outcome bounded by the caller's ctx. The wake itself is
-// owned by the proxy, not by any request: it runs in its own goroutine on a
-// background context (see runWake), so it keeps going even if the client that
-// triggered it - or every client - times out, disconnects, or the proxy is
-// asked to shut down. All requests (the one that started the wake and any
-// that join it) merely wait on the shared completion channel of the same
-// wake generation; a client that leaves only stops waiting, it never cancels
-// the wake.
-func (p *ProxyService) wakeAndWait(ctx context.Context, target *TargetState) (int, error) {
-	var gen int
-	var info *wakeInfo
-	target.mu.Lock()
-	if !target.IsWaking {
-		target.wakeGen++
-		gen = target.wakeGen
-		target.IsWaking = true
-		target.LastActivity = time.Now()
-		info = &wakeInfo{gen: gen, done: make(chan struct{})}
-		target.wake = info
-		target.mu.Unlock()
-
-		p.logger.Info("Target %s (%s) is down, starting wake (gen=%d)",
-			target.Target.Name, target.Target.Hostname, gen)
-		go p.runWake(target, info)
-	} else {
-		gen = target.wakeGen
-		info = target.wake
-		target.mu.Unlock()
-		p.logger.Info("Target %s (%s) wake already in progress, joining existing wait (gen=%d)",
-			target.Target.Name, target.Target.Hostname, gen)
-	}
-	return gen, p.joinWake(ctx, target, info)
-}
-
-// runWake performs the actual wake (WOL packet + health polling) for one
-// generation, fully detached from any request context. Clients routinely time
-// out (e.g. 10s) long before a machine can boot (startup_time defaults to
-// 30s), so the wake must outlive them: it runs on a fresh background context
-// bounded only by the (per-target) wake timeout, and it always reaches
-// finishWake, which releases every waiter and clears IsWaking.
-func (p *ProxyService) runWake(target *TargetState, info *wakeInfo) {
-	if err := p.wolSender.SendWOL(
-		target.Target.MacAddress,
-		target.Target.BroadcastIP,
-		target.Target.WolPort,
-	); err != nil {
-		p.finishWake(target, info, fmt.Errorf("failed to send WOL: %w", err))
-		return
-	}
-
-	p.logger.Info("WOL packet sent to %s (%s), waiting for server to wake (gen=%d)",
-		target.Target.Name, target.Target.Hostname, info.gen)
-
-	wakeCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	p.finishWake(target, info, p.waitForWake(wakeCtx, target, info.gen))
-}
-
-// finishWake publishes the outcome of a wake generation, clears IsWaking and
-// releases every waiter in one critical section, so no new wake generation
-// can start in between the state update and the close of done: joiners that
-// wake up on done always observe the result of the generation they joined.
-func (p *ProxyService) finishWake(target *TargetState, info *wakeInfo, err error) {
-	target.mu.Lock()
-	if target.wakeGen == info.gen {
-		target.IsWaking = false
-	}
-	info.err = err
-	target.mu.Unlock()
-	close(info.done)
-}
-
-// joinWake makes a request wait for one wake generation to finish, bounded by
-// the request's ctx. A result of ctx.Err() only means "this client stopped
-// waiting"; the wake itself keeps running (runWake is detached from the
-// request), so the target is still confirmed - and the post-wake cache
-// refresh still runs - even if every client gave up.
-func (p *ProxyService) joinWake(ctx context.Context, target *TargetState, info *wakeInfo) error {
-	if info == nil {
-		return fmt.Errorf("no in-flight wake to join for %s", target.Target.Name)
-	}
-
-	select {
-	case <-info.done:
-		// finishWake published info.err in the same critical section that
-		// cleared IsWaking, before closing done: it always describes this
-		// generation, even if a new wake has already started meanwhile.
-		target.mu.RLock()
-		healthy := target.IsHealthy
-		target.mu.RUnlock()
-		if healthy {
-			return nil
-		}
-		if info.err != nil {
-			return info.err
-		}
-		return fmt.Errorf("wake failed for %s", target.Target.Name)
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-// waitForWake repeatedly sends a burst of WOL packets and waits for the
-// target to come up. Each cycle is strictly: send a burst of burstCount
-// packets 500ms apart, THEN wait the full waitDuration, and only THEN perform
-// a single health check. Checking health immediately after a burst is
-// pointless - the machine hasn't had time to boot - so no check happens until
-// the full wait has elapsed.
-//
-// The first wait starts at startup_time (a machine that just got its WOL
-// packet cannot answer a health check yet). The interval between subsequent
-// checks is either:
-//   - adaptive (default): halved on every retry, floored at 500ms
-//     (30s, 15s, 7.5s, ...), which converges quickly once the machine is
-//     close to being up; or
-//   - fixed: the target's wake_health_check_interval (e.g. 2s), which spots
-//     a booted machine within one interval (also floored at 500ms).
-//
-// The whole operation is bounded by the target's wake timeout (its
-// wake_timeout, or the global timeout when the target does not override it)
-// - deliberately independent of any client request's deadline.
-func (p *ProxyService) waitForWake(ctx context.Context, target *TargetState, wakeGen int) error {
-	wakeTimeout := p.config.Timeout
-	if perTarget, ok := p.config.WakeTimeouts[target.Target.Name]; ok {
-		wakeTimeout = perTarget
-	}
-	checkInterval := p.config.WakeCheckIntervals[target.Target.Name]
-
-	timeout := time.After(wakeTimeout)
-	wakeStartTime := time.Now()
-	waitDuration := p.config.StartupTime
-	burstCount := 3
-	if target.Target.WOLBurstCount > 0 {
-		if target.Target.WOLBurstCount < 1 {
-			burstCount = 1
-		} else if target.Target.WOLBurstCount > 10 {
-			burstCount = 10
-		} else {
-			burstCount = target.Target.WOLBurstCount
-		}
-	}
-	burstInterval := 500 * time.Millisecond
-
-	// sendWOLBurst sends burstCount WOL packets burstInterval apart. It
-	// returns early (with ctx.Err()) if the context is cancelled mid-burst.
-	sendWOLBurst := func() error {
-		for i := 0; i < burstCount; i++ {
-			if err := p.wolSender.SendWOL(
-				target.Target.MacAddress,
-				target.Target.BroadcastIP,
-				target.Target.WolPort,
-			); err != nil {
-				p.logger.Error("Failed to send WOL packet during burst: %v", err)
-			} else {
-				p.logger.Info("Sent WOL burst packet %d/%d to %s (%s)",
-					i+1, burstCount, target.Target.Name, target.Target.Hostname)
-			}
-			if i < burstCount-1 {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-timeout:
-					return fmt.Errorf("timeout waiting for %s to wake up after %v",
-						target.Target.Name, wakeTimeout)
-				case <-time.After(burstInterval):
-				}
-			}
-		}
-		return nil
-	}
-
-	for {
-		if err := sendWOLBurst(); err != nil {
-			return err
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timeout:
-			return fmt.Errorf("timeout waiting for %s to wake up after %v",
-				target.Target.Name, wakeTimeout)
-		case <-time.After(waitDuration):
-		}
-
-		if p.healthChecker.Check(ctx, target.Target.HealthEndpoint, "wake") {
-			target.mu.Lock()
-			target.IsHealthy = true
-			target.LastCheck = time.Now()
-			target.mu.Unlock()
-
-			wakeDuration := time.Since(wakeStartTime)
-			p.logger.Info("Target %s (%s) woke up after %v (gen=%d)",
-				target.Target.Name, target.Target.Hostname, wakeDuration, wakeGen)
-
-			if p.cache != nil && p.config.CacheEnabled {
-				// Refresh the cached paths now that the target is reachable
-				// again. This used to only *invalidate* the cache and rely on
-				// the next warm tick (up to warm_interval later) or a future
-				// proxied GET to repopulate it: if the target went offline
-				// before that happened, cached endpoints (e.g. /models) fell
-				// back to triggering WOL on every request. Refreshing in place
-				// (instead of deleting first) also keeps the previous entries
-				// servable if the refresh itself fails.
-				go p.warmCache(target.Target.Name)
-			}
-
-			return nil
-		}
-
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timeout:
-			return fmt.Errorf("timeout waiting for %s to wake up after %v",
-				target.Target.Name, wakeTimeout)
-		default:
-			if checkInterval > 0 {
-				if checkInterval < 500*time.Millisecond {
-					checkInterval = 500 * time.Millisecond
-				}
-				waitDuration = checkInterval
-			} else {
-				waitDuration = waitDuration / 2
-				if waitDuration < 500*time.Millisecond {
-					waitDuration = 500 * time.Millisecond
-				}
-			}
-		}
-	}
-}
-
-type catchingBody struct {
-	io.Reader
-	original io.ReadCloser
-	onDone   func()
-	closed   bool
-}
-
-func (cb *catchingBody) Close() error {
-	if cb.closed {
-		return nil
-	}
-	cb.closed = true
-
-	if cb.onDone != nil {
-		cb.onDone()
-	}
-	if cb.original != nil {
-		return cb.original.Close()
-	}
-	return nil
-}
-
-func (p *ProxyService) warmCache(targetName string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	p.logger.Debug("Starting cache warmup for target: %s", targetName)
-
-	cachedPaths := p.cache.GetCachedPathsForTarget(targetName)
-	if len(cachedPaths) == 0 {
-		p.logger.Debug("No cached paths to warm for target: %s", targetName)
-		return
-	}
-
-	targetState, exists := p.config.Targets[targetName]
-	if !exists {
-		return
-	}
-
-	target := targetState.Target
-	targetURL, err := url.Parse(target.Destination)
+// clientIP extracts the bare IP from an "ip:port" remote address.
+func clientIP(remoteAddr string) string {
+	ip, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
-		return
+		return remoteAddr
 	}
-
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-				DualStack: true,
-			}).DialContext,
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          10,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-			DisableCompression:    true,
-		},
-	}
-
-	for _, path := range cachedPaths {
-		select {
-		case <-ctx.Done():
-			p.logger.Debug("Cache warmup cancelled for target: %s", targetName)
-			return
-		case <-time.After(100 * time.Millisecond):
-		}
-
-		reqURL := *targetURL
-		reqURL.Path = path
-
-		req, err := http.NewRequestWithContext(ctx, "GET", reqURL.String(), nil)
-		if err != nil {
-			p.logger.Error("Failed to create request for %s %s: %v", targetName, path, err)
-			continue
-		}
-
-		resp, err := client.Do(req)
-		if err != nil {
-			p.logger.Error("Failed to warm cache for %s %s: %v", targetName, path, err)
-			continue
-		}
-
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			body, err := io.ReadAll(io.LimitReader(resp.Body, p.config.CacheMaxResponseSize))
-			resp.Body.Close()
-
-			if err == nil {
-				p.cache.Save(targetName, path, resp.StatusCode, resp.Header, body)
-			}
-		} else {
-			resp.Body.Close()
-		}
-	}
-
-	p.logger.Debug("Cache warmup completed for target: %s", targetName)
+	return ip
 }
-
-func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, target *Target) {
-	if targetState, exists := p.config.Targets[target.Name]; exists {
-		targetState.mu.Lock()
-		targetState.LastActivity = time.Now()
-		targetState.mu.Unlock()
-	}
-
-	targetURL, err := url.Parse(target.Destination)
-	if err != nil {
-		p.logger.Error("Invalid target URL %s: %v", target.Destination, err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-
-	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	proxy.Transport = p.proxyTransport
-
-	// Customize the proxy to handle errors and logging
-	originalDirector := proxy.Director
-	proxy.Director = func(req *http.Request) {
-		originalDirector(req)
-		// Set the Host header to the target's hostname from the URL
-		req.Host = targetURL.Host
-
-		// Log request details including content length for debugging
-		contentLength := req.ContentLength
-		contentType := req.Header.Get("Content-Type")
-		p.logger.Info("Proxying %s %s to %s (Host: %s, Content-Length: %d, Content-Type: %s)",
-			req.Method, req.URL.Path, targetURL, req.Host, contentLength, contentType)
-
-		// For large uploads, add special handling
-		if contentLength > 1024*1024 { // If larger than 1MB
-			p.logger.Info("Large upload detected (%d bytes) for %s %s",
-				contentLength, req.Method, req.URL.Path)
-		}
-	}
-
-	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
-		p.logger.Error("Proxy error for %s (%s): %v", target.Name, target.Hostname, err)
-		http.Error(rw, "Bad Gateway", http.StatusBadGateway)
-	}
-
-	// Disable buffering of response body for streaming uploads/downloads
-	proxy.ModifyResponse = func(resp *http.Response) error {
-		p.logger.Info("Response from %s: status=%d, content-length=%d",
-			target.Name, resp.StatusCode, resp.ContentLength)
-
-		if p.cache != nil && p.config.CacheEnabled && r.Method == "GET" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			cachePaths, exists := p.config.CachePaths[target.Name]
-			if exists {
-				var shouldCache bool
-				for _, pattern := range cachePaths {
-					if strings.HasSuffix(pattern, "/*") {
-						prefix := strings.TrimSuffix(pattern, "/*")
-						if strings.HasPrefix(r.URL.Path, prefix) {
-							shouldCache = true
-							break
-						}
-					} else if r.URL.Path == pattern {
-						shouldCache = true
-						break
-					}
-				}
-
-				if shouldCache {
-					buf := &bytes.Buffer{}
-					tee := io.TeeReader(resp.Body, buf)
-					resp.Body = &catchingBody{
-						Reader:   tee,
-						original: resp.Body,
-						onDone: func() {
-							body := buf.Bytes()
-							if int64(len(body)) <= p.config.CacheMaxResponseSize {
-								p.cache.Save(target.Name, r.URL.Path, resp.StatusCode, resp.Header, body)
-							}
-						},
-					}
-				}
-			}
-		}
-
-		return nil
-	}
-
-	proxy.ServeHTTP(w, r)
-}
-
-// Config loader
-func LoadConfig(filename string) (*ProxyConfig, error) {
-	var config Config
-	_, err := toml.DecodeFile(filename, &config)
-	if err != nil {
-		return nil, err
-	}
-
-	// Trim whitespace and handle optional SSL certificate fields
-	config.SSLCertificate = strings.TrimSpace(config.SSLCertificate)
-	config.SSLCertificateKey = strings.TrimSpace(config.SSLCertificateKey)
-
-	// client_hostname_lookup is optional; unset means enabled
-	clientHostnameLookup := true
-	if config.ClientHostnameLookup != nil {
-		clientHostnameLookup = *config.ClientHostnameLookup
-	}
-
-	// Set defaults
-	if config.Port == "" {
-		config.Port = ":8080"
-	}
-	if !strings.HasPrefix(config.Port, ":") {
-		config.Port = ":" + config.Port
-	}
-
-	// timeout is the default wake timeout: how long to wait for a target to
-	// boot after a WOL packet. It is optional (defaults to 2m) and can be
-	// overridden per target with wake_timeout.
-	timeout := 120 * time.Second
-	if config.Timeout != "" {
-		timeout, err = time.ParseDuration(config.Timeout)
-		if err != nil {
-			return nil, fmt.Errorf("invalid timeout: %w", err)
-		}
-	}
-
-	startupTime := 30 * time.Second
-	if config.StartupTime != "" {
-		startupTime, err = time.ParseDuration(config.StartupTime)
-		if err != nil {
-			return nil, fmt.Errorf("invalid startup_time: %w", err)
-		}
-	}
-	if startupTime >= timeout {
-		return nil, fmt.Errorf("startup_time (%v) must be less than timeout (%v)", startupTime, timeout)
-	}
-
-	if config.ResponseHeaderTimeout == "" {
-		config.ResponseHeaderTimeout = "1m"
-	}
-	responseHeaderTimeout, err := time.ParseDuration(config.ResponseHeaderTimeout)
-	if err != nil {
-		return nil, fmt.Errorf("invalid response_header_timeout: %w", err)
-	}
-
-	// Parse response_timeout: 0 means no timeout (useful for SSE/long streams).
-	// A negative value is rejected: it would be an already-passed deadline,
-	// making every request fail instantly.
-	responseTimeout := time.Duration(0)
-	if config.ResponseTimeout != "" {
-		responseTimeout, err = time.ParseDuration(config.ResponseTimeout)
-		if err != nil {
-			return nil, fmt.Errorf("invalid response_timeout: %w", err)
-		}
-		if responseTimeout < 0 {
-			return nil, fmt.Errorf("response_timeout must not be negative, got %s", config.ResponseTimeout)
-		}
-	}
-
-	// Parse request_timeout: 0 means no timeout (useful for SSE/long streams).
-	requestTimeout := time.Duration(0)
-	if config.RequestTimeout != "" {
-		requestTimeout, err = time.ParseDuration(config.RequestTimeout)
-		if err != nil {
-			return nil, fmt.Errorf("invalid request_timeout: %w", err)
-		}
-		if requestTimeout < 0 {
-			return nil, fmt.Errorf("request_timeout must not be negative, got %s", config.RequestTimeout)
-		}
-	}
-
-	healthCheckInterval, err := time.ParseDuration(config.HealthCheckInterval)
-	if err != nil {
-		return nil, fmt.Errorf("invalid health_check_interval: %w", err)
-	}
-
-	healthCacheDuration, err := time.ParseDuration(config.HealthCacheDuration)
-	if err != nil {
-		return nil, fmt.Errorf("invalid health_cache_duration: %w", err)
-	}
-
-	var cacheEnabled bool
-	var cacheRootPath string
-	var cacheTTL time.Duration
-	var cacheMaxResponseSize int64
-	var cacheWarmInterval time.Duration
-	cachePaths := make(map[string][]string)
-
-	if config.CacheConfig.Enabled {
-		cacheEnabled = true
-		cacheRootPath = config.CacheConfig.RootPath
-		if cacheRootPath == "" {
-			cacheRootPath = "./cache"
-		}
-
-		cacheTTL = 24 * time.Hour
-		if config.CacheConfig.TTL != "" {
-			cacheTTL, err = time.ParseDuration(config.CacheConfig.TTL)
-			if err != nil {
-				return nil, fmt.Errorf("invalid cache ttl: %w", err)
-			}
-		}
-
-		cacheMaxResponseSize = 10 * 1024 * 1024
-		if config.CacheConfig.MaxResponseSizeBytes > 0 {
-			cacheMaxResponseSize = config.CacheConfig.MaxResponseSizeBytes
-		}
-
-		cacheWarmInterval = 30 * time.Minute
-		if config.CacheConfig.WarmInterval != "" {
-			cacheWarmInterval, err = time.ParseDuration(config.CacheConfig.WarmInterval)
-			if err != nil {
-				return nil, fmt.Errorf("invalid cache warm_interval: %w", err)
-			}
-		}
-
-		for _, ct := range config.CacheConfig.Targets {
-			if ct.Target != "" && len(ct.Paths) > 0 {
-				cachePaths[ct.Target] = ct.Paths
-			}
-		}
-	}
-
-	targets := make(map[string]*TargetState)
-	hostnameMap := make(map[string]string)
-	inactivityThresholds := make(map[string]time.Duration)
-	wakeTimeouts := make(map[string]time.Duration)
-	wakeCheckIntervals := make(map[string]time.Duration)
-
-	for _, target := range config.Targets {
-		if target.Hostname == "" {
-			return nil, fmt.Errorf("target %s is missing hostname", target.Name)
-		}
-
-		// Check for duplicate hostnames
-		if existingTarget, exists := hostnameMap[target.Hostname]; exists {
-			return nil, fmt.Errorf("duplicate hostname %s for targets %s and %s",
-				target.Hostname, existingTarget, target.Name)
-		}
-
-		// Validate WOL configuration
-		if target.MacAddress == "" {
-			return nil, fmt.Errorf("target %s is missing mac_address", target.Name)
-		}
-		if target.BroadcastIP == "" {
-			return nil, fmt.Errorf("target %s is missing broadcast_ip", target.Name)
-		}
-		if _, err := net.ParseMAC(target.MacAddress); err != nil {
-			return nil, fmt.Errorf("target %s has invalid mac_address %q: %w", target.Name, target.MacAddress, err)
-		}
-		if _, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:0", target.BroadcastIP)); err != nil {
-			return nil, fmt.Errorf("target %s has invalid broadcast_ip %q: %w", target.Name, target.BroadcastIP, err)
-		}
-		if target.WolPort != 0 && (target.WolPort < 1 || target.WolPort > 65535) {
-			return nil, fmt.Errorf("target %s has invalid wol_port %d (must be 1-65535 or 0 for default)", target.Name, target.WolPort)
-		}
-		if target.WolPort == 0 {
-			target.WolPort = 9 // standard Wake-on-LAN port
-		}
-
-		// Validate shutdown configuration
-		// Disallow using both SSH shutdown command and HTTP shutdown URL
-		if strings.TrimSpace(target.ShutdownHTTPUrl) != "" && strings.TrimSpace(target.ShutdownCommand) != "" {
-			return nil, fmt.Errorf("target %s: cannot define both shutdown_http_url and shutdown_command; choose one", target.Name)
-		}
-
-		// Disallow http method/ok status without URL
-		if strings.TrimSpace(target.ShutdownHTTPUrl) == "" && (strings.TrimSpace(target.ShutdownHTTPMethod) != "" || target.ShutdownHTTPOKStatus != 0) {
-			return nil, fmt.Errorf("target %s: shutdown_http_method and/or shutdown_http_ok_status require shutdown_http_url to be set", target.Name)
-		}
-
-		// Parse inactivity threshold if provided
-		if target.InactivityThreshold != "" {
-			inactivityThreshold, err := time.ParseDuration(target.InactivityThreshold)
-			if err != nil {
-				return nil, fmt.Errorf("invalid inactivity_threshold for target %s: %w", target.Name, err)
-			}
-			inactivityThresholds[target.Name] = inactivityThreshold
-		}
-
-		// Per-target wake timeout: overrides the global timeout for this
-		// target's wake operations only (forwarding is unaffected).
-		if target.WakeTimeout != "" {
-			wakeTimeout, err := time.ParseDuration(target.WakeTimeout)
-			if err != nil {
-				return nil, fmt.Errorf("invalid wake_timeout for target %s: %w", target.Name, err)
-			}
-			if startupTime >= wakeTimeout {
-				return nil, fmt.Errorf("startup_time (%v) must be less than wake_timeout (%v) for target %s",
-					startupTime, wakeTimeout, target.Name)
-			}
-			wakeTimeouts[target.Name] = wakeTimeout
-		}
-
-		// Per-target health check interval used while the target is waking
-		// (after the initial startup_time quiet period). Unset = adaptive
-		// halving of startup_time, floored at 500ms.
-		if target.WakeHealthCheckInterval != "" {
-			wakeCheckInterval, err := time.ParseDuration(target.WakeHealthCheckInterval)
-			if err != nil {
-				return nil, fmt.Errorf("invalid wake_health_check_interval for target %s: %w", target.Name, err)
-			}
-			if wakeCheckInterval <= 0 {
-				return nil, fmt.Errorf("wake_health_check_interval for target %s must be positive", target.Name)
-			}
-			wakeCheckIntervals[target.Name] = wakeCheckInterval
-		}
-
-		targetCopy := target
-		targets[target.Name] = &TargetState{
-			Target:       &targetCopy,
-			LastActivity: time.Now(), // Initialize with current time
-		}
-		hostnameMap[target.Hostname] = target.Name
-	}
-
-	return &ProxyConfig{
-		Port:                  config.Port,
-		SSLCertificate:        config.SSLCertificate,
-		SSLCertificateKey:     config.SSLCertificateKey,
-		Timeout:               timeout,
-		StartupTime:           startupTime,
-		ResponseHeaderTimeout: responseHeaderTimeout,
-		ResponseTimeout:       responseTimeout,
-		RequestTimeout:        requestTimeout,
-		HealthCheckInterval:   healthCheckInterval,
-		HealthCacheDuration:   healthCacheDuration,
-		LogLevel:              config.LogLevel,
-		ClientHostnameLookup:  clientHostnameLookup,
-		Targets:               targets,
-		HostnameMap:           hostnameMap,
-		InactivityThresholds:  inactivityThresholds,
-		WakeTimeouts:          wakeTimeouts,
-		WakeCheckIntervals:    wakeCheckIntervals,
-		CacheEnabled:          cacheEnabled,
-		CacheRootPath:         cacheRootPath,
-		CacheTTL:              cacheTTL,
-		CacheMaxResponseSize:  cacheMaxResponseSize,
-		CacheWarmInterval:     cacheWarmInterval,
-		CachePaths:            cachePaths,
-	}, nil
-}
-
-// ---------------------------------------------------------------------------
-// Client identification
-// ---------------------------------------------------------------------------
 
 // clientResolver performs best-effort reverse DNS lookups for client IPs so
 // that incoming requests can be logged with the client's hostname when the
@@ -2221,133 +1682,1280 @@ func lookupClientAddr(ip string, timeout time.Duration) (string, error) {
 	}
 }
 
-// clientIP extracts the bare IP from an "ip:port" remote address.
-func clientIP(remoteAddr string) string {
-	ip, _, err := net.SplitHostPort(remoteAddr)
+func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
+	route := p.routeForRequest(r)
+
+	if route == nil {
+		p.logger.Error("No route found for hostname: %s", r.Host)
+		http.Error(w, "No route configured for this hostname", http.StatusNotFound)
+		return
+	}
+
+	machineState := route.Machine
+	machineName := machineState.Name
+
+	p.logger.Info("Incoming request for hostname: %s -> machine: %s, path: %s, client: %s",
+		r.Host, machineName, r.URL.Path, p.clientAddr(r))
+
+	// Check if we have fresh health data
+	cached, reason := p.healthCacheStatus(machineState)
+	if cached {
+		p.logger.Info("Machine %s is healthy, proxying immediately", machineName)
+		p.serveWhenReady(w, r, route)
+		return
+	}
+
+	// The machine looks down: before waking it, see whether the static cache
+	// can answer. A cached response means the client gets a full answer
+	// while the machine stays asleep.
+	if p.cache != nil && r.Method == http.MethodGet {
+		if resp, ok := p.cache.Get(route.Name, r.URL.Path); ok {
+			p.logger.Info("Serving cached response for %s %s (machine %s is down)",
+				r.Method, r.URL.Path, machineName)
+			for k, v := range resp.Header {
+				for _, header := range v {
+					w.Header().Add(k, header)
+				}
+			}
+			w.WriteHeader(resp.StatusCode)
+			io.Copy(w, resp.Body)
+			resp.Body.Close()
+			return
+		}
+	}
+
+	// Need to wake up the server
+	p.logger.Info("Machine %s appears down (%s), waking for %s", machineName, reason, route.Name)
+	p.healthChecker.CloseIdleConnections()
+	if err := p.wakeAndWait(r.Context(), machineState); err != nil {
+		p.logger.Error("Failed to wake machine %s: %v", machineName, err)
+		http.Error(w, "Service temporarily unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	p.logger.Info("Machine %s is now healthy, proxying request", machineName)
+	p.serveWhenReady(w, r, route)
+}
+
+// serveWhenReady gates forwarding on the route's own readiness. A machine can be
+// awake seconds before the service behind a route accepts connections, and
+// forwarding into that gap turns a successful wake into a 502.
+func (p *ProxyService) serveWhenReady(w http.ResponseWriter, r *http.Request, route *Route) {
+	cached, reason := p.readyCacheStatus(route)
+	if cached {
+		p.proxyRequest(w, r, route)
+		return
+	}
+
+	p.logger.Info("Route %s not ready (%s), waiting", route.Name, reason)
+	if err := p.waitForReady(r.Context(), route); err != nil {
+		p.logger.Error("Route %s did not become ready: %v", route.Name, err)
+		http.Error(w, "Service temporarily unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	p.proxyRequest(w, r, route)
+}
+
+func (p *ProxyService) readyCacheStatus(route *Route) (cached bool, reason string) {
+	route.mu.RLock()
+	defer route.mu.RUnlock()
+
+	if !route.IsReady {
+		if route.LastCheck.IsZero() {
+			return false, "no prior readiness check"
+		}
+		return false, fmt.Sprintf("marked unready (last check %v ago)",
+			p.clock.Now().Sub(route.LastCheck).Round(time.Second))
+	}
+
+	age := p.clock.Now().Sub(route.LastCheck)
+	if age > p.config.HealthCacheDuration {
+		return false, fmt.Sprintf("cached readiness expired (last check %v ago)", age.Round(time.Second))
+	}
+
+	return true, ""
+}
+
+func (p *ProxyService) waitForReady(ctx context.Context, route *Route) error {
+	// Check before waiting on a tick. A cached readiness result expires well before
+	// the next background sweep refreshes it, so most requests that land here are for
+	// routes that are in fact ready and should not pay a poll interval of latency.
+	if p.markReadyIfHealthy(ctx, route) {
+		return nil
+	}
+
+	timeout := p.clock.After(p.config.Timeout)
+	ticker := p.clock.NewTicker(p.config.PollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timeout:
+			return fmt.Errorf("timeout waiting for route %s to become ready after %v",
+				route.Name, p.config.Timeout)
+		case <-ticker.C():
+			if p.markReadyIfHealthy(ctx, route) {
+				return nil
+			}
+		}
+	}
+}
+
+func (p *ProxyService) markReadyIfHealthy(ctx context.Context, route *Route) bool {
+	if !p.healthChecker.Check(ctx, route.HealthCheck, "readiness") {
+		return false
+	}
+
+	route.mu.Lock()
+	route.IsReady = true
+	route.LastCheck = p.clock.Now()
+	route.mu.Unlock()
+	return true
+}
+
+func (p *ProxyService) routeForRequest(r *http.Request) *Route {
+	// Remove port from host if present
+	host := r.Host
+	if colonIndex := strings.Index(host, ":"); colonIndex != -1 {
+		host = host[:colonIndex]
+	}
+
+	return p.config.RoutesByHostname[host]
+}
+
+func (p *ProxyService) healthCacheStatus(machine *Machine) (cached bool, reason string) {
+	machine.mu.RLock()
+	defer machine.mu.RUnlock()
+
+	if !machine.IsHealthy {
+		if machine.LastCheck.IsZero() {
+			return false, "no prior health check"
+		}
+		return false, fmt.Sprintf(
+			"marked unhealthy (last check %v ago)",
+			p.clock.Now().Sub(machine.LastCheck).Round(time.Second),
+		)
+	}
+
+	age := p.clock.Now().Sub(machine.LastCheck)
+	if age > p.config.HealthCacheDuration {
+		return false, fmt.Sprintf(
+			"cached health expired (last check %v ago, cache duration %v)",
+			age.Round(time.Second), p.config.HealthCacheDuration,
+		)
+	}
+
+	return true, ""
+}
+
+// defaultWOLBurstCount is how many magic packets a burst carries when the
+// machine does not configure wol_burst_count. A single packet is easy to lose
+// to a sleeping NIC or a switch that has not refreshed its ARP entry yet, so
+// each wake cycle sends a short burst instead.
+const defaultWOLBurstCount = 3
+
+// wakeAndWait makes sure a wake is in flight for the machine, then makes the
+// caller wait for its outcome bounded by the caller's ctx. The wake itself is
+// owned by the proxy, not by any request: it runs in its own goroutine on a
+// background context (see runWake), so it keeps going even if the client that
+// triggered it - or every client - times out, disconnects, or the proxy is
+// asked to shut down. All requests (the one that started the wake and any
+// that join it) merely wait on the shared completion channel of the same wake
+// generation; a client that leaves only stops waiting, it never cancels the
+// wake.
+func (p *ProxyService) wakeAndWait(ctx context.Context, machine *Machine) error {
+	var info *wakeInfo
+	machine.mu.Lock()
+	if machine.IsWaking {
+		info = machine.wake
+		machine.mu.Unlock()
+		p.logger.Info("Machine %s wake already in progress, joining existing wait (gen=%d)",
+			machine.Name, info.gen)
+	} else {
+		machine.wakeGen++
+		machine.IsWaking = true
+		machine.LastActivity = p.clock.Now()
+		info = &wakeInfo{gen: machine.wakeGen, done: make(chan struct{})}
+		machine.wake = info
+		machine.mu.Unlock()
+
+		p.logger.Info("Machine %s is down, starting wake (gen=%d)", machine.Name, info.gen)
+		go p.runWake(machine, info)
+	}
+	return p.joinWake(ctx, machine, info)
+}
+
+// runWake performs the actual wake (WOL bursts + health polling) for one
+// generation, fully detached from any request context. Clients routinely time
+// out long before a machine can boot, so the wake must outlive them: it runs
+// on a fresh background context bounded only by the (per-machine) wake
+// timeout, and it always reaches finishWake, which releases every waiter and
+// clears IsWaking. The first burst packet goes out immediately; waitForWake
+// owns all packet sending.
+func (p *ProxyService) runWake(machine *Machine, info *wakeInfo) {
+	p.logger.Info("WOL wake started for %s (gen=%d)", machine.Name, info.gen)
+
+	wakeCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p.finishWake(machine, info, p.waitForWake(wakeCtx, machine, info.gen))
+}
+
+// finishWake publishes the outcome of a wake generation, clears IsWaking and
+// releases every waiter in one critical section, so no new wake generation
+// can start in between the state update and the close of done: joiners that
+// wake up on done always observe the result of the generation they joined.
+func (p *ProxyService) finishWake(machine *Machine, info *wakeInfo, err error) {
+	machine.mu.Lock()
+	if machine.wakeGen == info.gen {
+		machine.IsWaking = false
+	}
+	info.err = err
+	machine.mu.Unlock()
+	close(info.done)
+}
+
+// joinWake makes a request wait for one wake generation to finish, bounded by
+// the request's ctx. A result of ctx.Err() only means "this client stopped
+// waiting"; the wake itself keeps running (runWake is detached from the
+// request), so the machine is still confirmed even if every client gave up.
+func (p *ProxyService) joinWake(ctx context.Context, machine *Machine, info *wakeInfo) error {
+	if info == nil {
+		return fmt.Errorf("no in-flight wake to join for %s", machine.Name)
+	}
+
+	select {
+	case <-info.done:
+		// finishWake published info.err in the same critical section that
+		// cleared IsWaking, before closing done: it always describes this
+		// generation, even if a new wake has already started meanwhile.
+		machine.mu.RLock()
+		healthy := machine.IsHealthy
+		machine.mu.RUnlock()
+		if healthy {
+			return nil
+		}
+		if info.err != nil {
+			return info.err
+		}
+		return fmt.Errorf("wake failed for %s", machine.Name)
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// waitForWake repeatedly sends a burst of WOL packets and waits for the
+// machine to come up. Each cycle is strictly: send a burst of burstCount
+// packets 500ms apart, THEN wait the full waitDuration, and only THEN perform
+// a single health check. Checking health immediately after a burst is
+// pointless - the machine hasn't had time to boot - so no check happens until
+// the full wait has elapsed.
+//
+// The first wait starts at startup_time (a machine that just got its WOL
+// packet cannot answer a health check yet). The interval between subsequent
+// checks is either:
+//   - adaptive (default): halved on every retry, floored at 500ms
+//     (30s, 15s, 7.5s, ...), which converges quickly once the machine is
+//     close to being up; or
+//   - fixed: the machine's wake_health_check_interval (e.g. 2s), which spots
+//     a booted machine within one interval (also floored at 500ms).
+//
+// The whole operation is bounded by the machine's wake timeout (its
+// wake_timeout, or the global timeout when the machine does not override it) -
+// deliberately independent of any client request's deadline.
+func (p *ProxyService) waitForWake(ctx context.Context, machine *Machine, wakeGen int) error {
+	wakeTimeout := p.config.Timeout
+	if machine.Config.WakeTimeout > 0 {
+		wakeTimeout = machine.Config.WakeTimeout
+	}
+	checkInterval := machine.Config.WakeHealthCheckInterval
+
+	timeout := p.clock.After(wakeTimeout)
+	wakeStartTime := p.clock.Now()
+	waitDuration := p.config.StartupTime
+
+	burstCount := defaultWOLBurstCount
+	if machine.Config.WolBurstCount != 0 {
+		burstCount = machine.Config.WolBurstCount
+		if burstCount < 1 {
+			burstCount = 1
+		} else if burstCount > 10 {
+			burstCount = 10
+		}
+	}
+	burstInterval := 500 * time.Millisecond
+
+	// sendWOLBurst sends burstCount WOL packets burstInterval apart. It
+	// returns early (with the cancellation cause) if the context is
+	// cancelled or the wake times out mid-burst.
+	sendWOLBurst := func() error {
+		for i := 0; i < burstCount; i++ {
+			if err := p.wolSender.SendWOL(
+				machine.Config.MacAddress,
+				machine.Config.BroadcastIP,
+				machine.Config.WolPort,
+			); err != nil {
+				p.logger.Error("Failed to send WOL packet during burst: %v", err)
+			} else {
+				p.logger.Info("Sent WOL burst packet %d/%d to %s",
+					i+1, burstCount, machine.Name)
+			}
+			if i < burstCount-1 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-timeout:
+					return fmt.Errorf("timeout waiting for %s to wake up after %v",
+						machine.Name, wakeTimeout)
+				case <-p.clock.After(burstInterval):
+				}
+			}
+		}
+		return nil
+	}
+
+	for {
+		if err := sendWOLBurst(); err != nil {
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timeout:
+			return fmt.Errorf("timeout waiting for %s to wake up after %v",
+				machine.Name, wakeTimeout)
+		case <-p.clock.After(waitDuration):
+		}
+
+		if p.healthChecker.Check(ctx, machine.Config.HealthCheck, "wake") {
+			machine.mu.Lock()
+			machine.IsHealthy = true
+			machine.LastCheck = p.clock.Now()
+			machine.mu.Unlock()
+
+			wakeDuration := p.clock.Now().Sub(wakeStartTime)
+			p.logger.Info("Machine %s woke up after %v (gen=%d)",
+				machine.Name, wakeDuration, wakeGen)
+
+			if p.cache != nil {
+				// Refresh the cached paths now that the machine is
+				// reachable again. Only invalidating the cache and
+				// relying on the next warm tick (up to warm_interval
+				// later) or a future proxied GET to repopulate it means
+				// a machine that sleeps again before either happens
+				// falls back to triggering WOL on every cached request.
+				// Refreshing in place (instead of deleting first) also
+				// keeps the previous entries servable if the refresh
+				// itself fails.
+				go p.warmMachine(machine)
+			}
+			return nil
+		}
+
+		if checkInterval > 0 {
+			if checkInterval < 500*time.Millisecond {
+				checkInterval = 500 * time.Millisecond
+			}
+			waitDuration = checkInterval
+		} else {
+			waitDuration = waitDuration / 2
+			if waitDuration < 500*time.Millisecond {
+				waitDuration = 500 * time.Millisecond
+			}
+		}
+	}
+}
+
+// serveTCPRoute accepts connections on listener and forwards each to the route's
+// destination, waking the machine first if it is asleep. It returns when ctx is
+// cancelled or the listener stops accepting.
+func (p *ProxyService) serveTCPRoute(ctx context.Context, listener net.Listener, route *Route) error {
+	go func() {
+		<-ctx.Done()
+		listener.Close()
+	}()
+
+	p.logger.Info("Listening on %s for machine %s -> %s",
+		listener.Addr(), route.Machine.Name, route.Destination)
+
+	delay := time.Duration(0)
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if !isTemporaryAcceptError(err) {
+				return fmt.Errorf("accept on %s failed: %w", listener.Addr(), err)
+			}
+
+			// Back off rather than spinning, and keep serving: this route failing
+			// hard would propagate to main and take every other route down with it.
+			if delay == 0 {
+				delay = acceptRetryDelayMin
+			} else {
+				delay *= 2
+			}
+			if delay > acceptRetryDelayMax {
+				delay = acceptRetryDelayMax
+			}
+			p.logger.Error("Accept on %s failed (%v), retrying in %v",
+				listener.Addr(), err, delay)
+
+			select {
+			case <-p.clock.After(delay):
+			case <-ctx.Done():
+				return nil
+			}
+			continue
+		}
+
+		delay = 0
+		go p.forwardTCPConn(ctx, conn, route)
+	}
+}
+
+// forwardTCPConn wakes the machine if needed, then splices the accepted connection
+// to the destination. The client is already connected while we wake, so it waits on
+// the upstream's protocol banner rather than on connect — an ssh client with a short
+// ConnectTimeout still gets through a slow wake.
+func (p *ProxyService) forwardTCPConn(ctx context.Context, client net.Conn, route *Route) {
+	defer client.Close()
+
+	machine := route.Machine
+	if cached, reason := p.healthCacheStatus(machine); !cached {
+		p.logger.Info("Machine %s appears down (%s), waking for %s", machine.Name, reason, route.Name)
+		if err := p.wakeAndWait(ctx, machine); err != nil {
+			p.logger.Error("Failed to wake machine %s for %s: %v", machine.Name, route.Name, err)
+			return
+		}
+	}
+
+	if cached, reason := p.readyCacheStatus(route); !cached {
+		p.logger.Info("Route %s not ready (%s), waiting before forwarding", route.Name, reason)
+		if err := p.waitForReady(ctx, route); err != nil {
+			p.logger.Error("Route %s did not become ready: %v", route.Name, err)
+			return
+		}
+	}
+
+	dialer := net.Dialer{Timeout: p.config.Timeout}
+	upstream, err := dialer.DialContext(ctx, "tcp", route.Destination)
 	if err != nil {
-		return remoteAddr
+		p.logger.Error("Could not reach %s for route %s: %v", route.Destination, route.Name, err)
+		return
 	}
-	return ip
+	defer upstream.Close()
+
+	machine.mu.Lock()
+	machine.LastActivity = p.clock.Now()
+	machine.mu.Unlock()
+
+	machine.holdConnection()
+	defer func() { machine.releaseConnection(p.clock.Now()) }()
+
+	// Both directions must finish before the deferred closes run. A client that
+	// half-closes its write side — ssh and scp both do, once the request is sent —
+	// ends one direction while the response is still streaming back on the other.
+	var copies sync.WaitGroup
+	copies.Add(2)
+	splice := func(dst, src net.Conn) {
+		defer copies.Done()
+		io.Copy(dst, src)
+		// Half-close so the peer sees EOF while the other direction still drains.
+		if conn, ok := dst.(*net.TCPConn); ok {
+			conn.CloseWrite()
+		}
+	}
+	go splice(upstream, client)
+	go splice(client, upstream)
+
+	done := make(chan struct{})
+	go func() {
+		copies.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
 }
 
-// describeClient renders what is known about the sender of a request. The
-// source address is always present; the reverse-DNS hostname, the
-// User-Agent and common proxy headers (X-Forwarded-For, X-Real-IP,
-// X-Forwarded-Host) are added when available so the logs make it clear
-// which service or machine the request came from.
-func (p *ProxyService) describeClient(r *http.Request) string {
-	parts := []string{"client: " + r.RemoteAddr}
+func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, route *Route) {
+	machineState := route.Machine
+	machineState.mu.Lock()
+	machineState.LastActivity = p.clock.Now()
+	machineState.mu.Unlock()
 
-	if host, ok := p.clientResolver.resolve(clientIP(r.RemoteAddr)); ok {
-		parts = append(parts, "hostname: "+host)
+	// A slow upload or download can outlast the inactivity threshold; hold the
+	// machine for as long as the request is in flight.
+	machineState.holdConnection()
+	defer func() { machineState.releaseConnection(p.clock.Now()) }()
+
+	targetURL, err := url.Parse(route.Destination)
+	if err != nil {
+		p.logger.Error("Invalid target URL %s: %v", route.Destination, err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
 	}
-	if ua := r.UserAgent(); ua != "" {
-		parts = append(parts, fmt.Sprintf("user-agent: %q", truncate(ua, 200)))
+
+	proxy := httputil.NewSingleHostReverseProxy(targetURL)
+
+	// Create a custom transport with optimized settings for large uploads
+	proxy.Transport = &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   60 * time.Second, // Increased timeout for slow connections
+			KeepAlive: 60 * time.Second, // Increased keep-alive
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       120 * time.Second, // Increased idle timeout
+		TLSHandshakeTimeout:   20 * time.Second,  // Increased TLS handshake timeout
+		ExpectContinueTimeout: 5 * time.Second,   // Increased expect-continue timeout
+		MaxIdleConnsPerHost:   10,
+		// Disable compression to avoid issues with already compressed data
+		DisableCompression:    true,
+		ResponseHeaderTimeout: p.config.ResponseHeaderTimeout,
+		// No timeout for reading the entire response
+		ReadBufferSize:  1024 * 1024, // 1MB buffer for reading
+		WriteBufferSize: 1024 * 1024, // 1MB buffer for writing
 	}
-	if v := r.Header.Get("X-Forwarded-For"); v != "" {
-		parts = append(parts, "x-forwarded-for: "+v)
+
+	// Customize the proxy to handle errors and logging
+	originalDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		originalDirector(req)
+		// Set the Host header to the target's hostname from the URL
+		req.Host = targetURL.Host
+
+		// Log request details including content length for debugging
+		contentLength := req.ContentLength
+		contentType := req.Header.Get("Content-Type")
+		p.logger.Info("Proxying %s %s to %s (Host: %s, Content-Length: %d, Content-Type: %s)",
+			req.Method, req.URL.Path, targetURL, req.Host, contentLength, contentType)
+
+		// For large uploads, add special handling
+		if contentLength > 1024*1024 { // If larger than 1MB
+			p.logger.Info("Large upload detected (%d bytes) for %s %s",
+				contentLength, req.Method, req.URL.Path)
+		}
 	}
-	if v := r.Header.Get("X-Real-IP"); v != "" {
-		parts = append(parts, "x-real-ip: "+v)
+
+	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+		p.logger.Error("Proxy error for %s (%s): %v", route.Machine.Name, route.Hostname, err)
+		http.Error(rw, "Bad Gateway", http.StatusBadGateway)
 	}
-	if v := r.Header.Get("X-Forwarded-Host"); v != "" {
-		parts = append(parts, "x-forwarded-host: "+v)
+
+	// Disable buffering of response body for streaming uploads/downloads
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		p.logger.Info("Response from %s: status=%d, content-length=%d",
+			route.Name, resp.StatusCode, resp.ContentLength)
+
+		if p.cache != nil && r.Method == http.MethodGet && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			cachePaths, exists := p.config.CacheRoutes[route.Name]
+			if exists {
+				var shouldCache bool
+				for _, pattern := range cachePaths {
+					if strings.HasSuffix(pattern, "/*") {
+						prefix := strings.TrimSuffix(pattern, "/*")
+						if strings.HasPrefix(r.URL.Path, prefix) {
+							shouldCache = true
+							break
+						}
+					} else if r.URL.Path == pattern {
+						shouldCache = true
+						break
+					}
+				}
+
+				if shouldCache {
+					buf := &bytes.Buffer{}
+					tee := io.TeeReader(resp.Body, buf)
+					resp.Body = &catchingBody{
+						Reader:   tee,
+						original: resp.Body,
+						onDone: func() {
+							body := buf.Bytes()
+							if int64(len(body)) <= p.config.CacheMaxResponseSize {
+								p.cache.Save(route.Name, r.URL.Path, resp.StatusCode, resp.Header, body)
+							}
+						},
+					}
+				}
+			}
+		}
+
+		return nil
 	}
-	return strings.Join(parts, " ")
+
+	proxy.ServeHTTP(w, r)
 }
 
-// truncate shortens s to at most n runes, appending an ellipsis when cut.
-func truncate(s string, n int) string {
-	r := []rune(s)
-	if len(r) <= n {
-		return s
+// Config loader
+func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
+	var config Config
+	meta, err := toml.DecodeFile(filename, &config)
+	if err != nil {
+		return nil, err
 	}
-	return string(r[:n]) + "…"
+
+	// A key the struct does not claim is almost always a typo, and decoding leaves
+	// the field at its zero value — which is how a config ends up with, say, no
+	// health check at all and no hint as to why. Refuse rather than run degraded.
+	if undecoded := meta.Undecoded(); len(undecoded) > 0 {
+		keys := make([]string, 0, len(undecoded))
+		for _, key := range undecoded {
+			keys = append(keys, key.String())
+		}
+		return nil, fmt.Errorf("unknown key(s) in %s: %s", filename, strings.Join(keys, ", "))
+	}
+
+	// Trim whitespace and handle optional SSL certificate fields
+	config.SSLCertificate = strings.TrimSpace(config.SSLCertificate)
+	config.SSLCertificateKey = strings.TrimSpace(config.SSLCertificateKey)
+
+	// Set defaults
+	if config.Port == "" {
+		config.Port = ":8080"
+	}
+	if !strings.HasPrefix(config.Port, ":") {
+		config.Port = ":" + config.Port
+	}
+
+	timeout, err := time.ParseDuration(config.Timeout)
+	if err != nil {
+		return nil, fmt.Errorf("invalid timeout: %w", err)
+	}
+
+	// startup_time is the quiet period between the first WOL packet and the
+	// first health check: a machine that was just sent a magic packet cannot
+	// answer one yet. It must fit inside each machine's wake budget (its
+	// wake_timeout, or the global timeout), or the wake times out before it
+	// ever checks.
+	startupTime := 30 * time.Second
+	if config.StartupTime != "" {
+		startupTime, err = time.ParseDuration(config.StartupTime)
+		if err != nil {
+			return nil, fmt.Errorf("invalid startup_time: %w", err)
+		}
+	}
+
+	if config.RequestHeaderTimeout == "" {
+		config.RequestHeaderTimeout = "30s"
+	}
+	requestHeaderTimeout, err := time.ParseDuration(config.RequestHeaderTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("invalid request_header_timeout: %w", err)
+	}
+
+	if config.ResponseHeaderTimeout == "" {
+		config.ResponseHeaderTimeout = "1m"
+	}
+	responseHeaderTimeout, err := time.ParseDuration(config.ResponseHeaderTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("invalid response_header_timeout: %w", err)
+	}
+
+	if config.ServerReadTimeout == "" {
+		config.ServerReadTimeout = "10m"
+	}
+	serverReadTimeout, err := time.ParseDuration(config.ServerReadTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server_read_timeout: %w", err)
+	}
+
+	if config.ServerWriteTimeout == "" {
+		config.ServerWriteTimeout = "10m"
+	}
+	serverWriteTimeout, err := time.ParseDuration(config.ServerWriteTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server_write_timeout: %w", err)
+	}
+
+	if config.ServerIdleTimeout == "" {
+		config.ServerIdleTimeout = "120s"
+	}
+	serverIdleTimeout, err := time.ParseDuration(config.ServerIdleTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server_idle_timeout: %w", err)
+	}
+
+	pollInterval, err := time.ParseDuration(config.PollInterval)
+	if err != nil {
+		return nil, fmt.Errorf("invalid poll_interval: %w", err)
+	}
+
+	healthCheckInterval, err := time.ParseDuration(config.HealthCheckInterval)
+	if err != nil {
+		return nil, fmt.Errorf("invalid health_check_interval: %w", err)
+	}
+
+	healthCacheDuration, err := time.ParseDuration(config.HealthCacheDuration)
+	if err != nil {
+		return nil, fmt.Errorf("invalid health_cache_duration: %w", err)
+	}
+
+	var cacheEnabled bool
+	var cacheRootPath string
+	var cacheTTL time.Duration
+	var cacheMaxResponseSize int64
+	var cacheWarmInterval time.Duration
+	cacheRoutes := make(map[string][]string)
+
+	if config.CacheConfig.Enabled {
+		cacheEnabled = true
+		cacheRootPath = config.CacheConfig.RootPath
+		if cacheRootPath == "" {
+			cacheRootPath = "./cache"
+		}
+
+		cacheTTL = 24 * time.Hour
+		if config.CacheConfig.TTL != "" {
+			cacheTTL, err = time.ParseDuration(config.CacheConfig.TTL)
+			if err != nil {
+				return nil, fmt.Errorf("invalid cache ttl: %w", err)
+			}
+		}
+
+		cacheMaxResponseSize = 10 * 1024 * 1024
+		if config.CacheConfig.MaxResponseSizeBytes > 0 {
+			cacheMaxResponseSize = config.CacheConfig.MaxResponseSizeBytes
+		}
+
+		cacheWarmInterval = 30 * time.Minute
+		if config.CacheConfig.WarmInterval != "" {
+			cacheWarmInterval, err = time.ParseDuration(config.CacheConfig.WarmInterval)
+			if err != nil {
+				return nil, fmt.Errorf("invalid cache warm_interval: %w", err)
+			}
+		}
+
+		for _, cr := range config.CacheConfig.Routes {
+			cacheRoutes[cr.Route] = cr.Paths
+		}
+	}
+
+	// client_hostname_lookup is optional; unset means enabled.
+	clientHostnameLookup := true
+	if config.ClientHostnameLookup != nil {
+		clientHostnameLookup = *config.ClientHostnameLookup
+	}
+
+	if len(config.Targets) > 0 && (len(config.Machines) > 0 || len(config.Routes) > 0) {
+		return nil, fmt.Errorf("config mixes the legacy [[targets]] format with [[machines]]/[[routes]]; use one or the other")
+	}
+
+	machineEntries, routeEntries := config.Machines, config.Routes
+	fromLegacy := len(config.Targets) > 0
+	if fromLegacy {
+		machineEntries, routeEntries = migrateLegacyTargets(config.Targets)
+	}
+
+	model, err := buildMachinesAndRoutes(machineEntries, routeEntries, clock, fromLegacy)
+	if err != nil {
+		return nil, err
+	}
+
+	// A cache block naming a route that does not exist is a typo that would
+	// otherwise silently cache nothing. TCP routes carry no HTTP semantics,
+	// so they cannot be cached either.
+	for _, cr := range config.CacheConfig.Routes {
+		found := false
+		for _, route := range model.routes {
+			if route.Name == cr.Route {
+				if route.IsTCP() {
+					return nil, fmt.Errorf("cache route %q is a TCP route; only HTTP routes can be cached", cr.Route)
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("cache references unknown route %q", cr.Route)
+		}
+	}
+
+	// startup_time must fit inside each machine's effective wake budget: its
+	// own wake_timeout when set, the global timeout otherwise.
+	for _, m := range model.machines {
+		if m.Config.WakeTimeout > 0 {
+			if startupTime >= m.Config.WakeTimeout {
+				return nil, fmt.Errorf("startup_time (%v) must be less than wake_timeout (%v) for machine %s",
+					startupTime, m.Config.WakeTimeout, m.Name)
+			}
+		} else if startupTime >= timeout {
+			return nil, fmt.Errorf("startup_time (%v) must be less than timeout (%v)", startupTime, timeout)
+		}
+	}
+
+	return &ProxyConfig{
+		Port:                  config.Port,
+		SSLCertificate:        config.SSLCertificate,
+		SSLCertificateKey:     config.SSLCertificateKey,
+		Timeout:               timeout,
+		StartupTime:           startupTime,
+		RequestHeaderTimeout:  requestHeaderTimeout,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		ServerReadTimeout:     serverReadTimeout,
+		ServerWriteTimeout:    serverWriteTimeout,
+		ServerIdleTimeout:     serverIdleTimeout,
+		ClientHostnameLookup:  clientHostnameLookup,
+		PollInterval:          pollInterval,
+		HealthCheckInterval:   healthCheckInterval,
+		HealthCacheDuration:   healthCacheDuration,
+		Machines:              model.machines,
+		Routes:                model.routes,
+		RoutesByHostname:      model.byHostname,
+		RoutesByListenPort:    model.byListenPort,
+		CacheEnabled:          cacheEnabled,
+		CacheRootPath:         cacheRootPath,
+		CacheTTL:              cacheTTL,
+		CacheMaxResponseSize:  cacheMaxResponseSize,
+		CacheWarmInterval:     cacheWarmInterval,
+		CacheRoutes:           cacheRoutes,
+	}, nil
+}
+
+// defaultHealthCheckForDestination derives a route's readiness check from where it
+// forwards to: dialing the destination is free, since the proxy is about to connect
+// there anyway. HTTP destinations are URLs and may leave the port implicit; TCP
+// destinations are already host:port.
+func defaultHealthCheckForDestination(destination string) (string, error) {
+	if !strings.Contains(destination, "://") {
+		if _, _, err := net.SplitHostPort(destination); err != nil {
+			return "", fmt.Errorf("destination %q must be host:port or a URL: %w", destination, err)
+		}
+		return tcpScheme + destination, nil
+	}
+
+	parsed, err := url.Parse(destination)
+	if err != nil {
+		return "", fmt.Errorf("invalid destination %q: %w", destination, err)
+	}
+
+	host, port := parsed.Hostname(), parsed.Port()
+	if host == "" {
+		return "", fmt.Errorf("destination %q has no host", destination)
+	}
+	if port == "" {
+		switch parsed.Scheme {
+		case "https":
+			port = "443"
+		default:
+			port = "80"
+		}
+	}
+
+	return tcpScheme + net.JoinHostPort(host, port), nil
+}
+
+// MigrateConfigFile writes the machines + routes translation of a legacy config
+// next to the original, so an operator can adopt it with a single mv. The original
+// is never touched: it is often bind-mounted read-only or checked into a config
+// repo, and rewriting it would silently drop every comment. If the sidecar cannot
+// be written, the translation is logged instead so nothing is lost.
+func MigrateConfigFile(path string, logger Logger) {
+	var config Config
+	if _, err := toml.DecodeFile(path, &config); err != nil {
+		return
+	}
+	if len(config.Targets) == 0 {
+		return
+	}
+
+	config.Machines, config.Routes = migrateLegacyTargets(config.Targets)
+	config.Targets = nil
+
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Encode(config); err != nil {
+		logger.Error("Could not translate the legacy config: %v", err)
+		return
+	}
+	migrated := dropUnsetIntKeys(buf.String())
+
+	ext := filepath.Ext(path)
+	migratedPath := strings.TrimSuffix(path, ext) + ".migrated" + ext
+
+	if err := os.WriteFile(migratedPath, []byte(migrated), 0o600); err != nil {
+		logger.Info("This config uses the legacy [[targets]] format. Could not write %s (%v); "+
+			"the migrated config follows — save it yourself:\n%s", migratedPath, err, migrated)
+		return
+	}
+
+	logger.Info("This config uses the legacy [[targets]] format, which will be removed in a future "+
+		"release. A migrated copy was written to %s — review it and replace your config with it.", migratedPath)
+}
+
+// dropUnsetIntKeys removes "key = 0" lines from encoded TOML. The toml encoder
+// honours omitempty for strings but not for ints, and every int key in this config
+// means "unset" at zero — emitting them would litter a migrated config with keys
+// the operator never wrote.
+func dropUnsetIntKeys(encoded string) string {
+	lines := strings.Split(encoded, "\n")
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.HasSuffix(strings.TrimSpace(line), "= 0") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
+}
+
+// migrateLegacyTargets translates [[targets]] blocks into the machines + routes
+// form. Each legacy target was a machine and a route rolled into one, so it
+// becomes exactly one of each.
+func migrateLegacyTargets(targets []Target) ([]MachineEntry, []RouteEntry) {
+	machines := make([]MachineEntry, 0, len(targets))
+	routes := make([]RouteEntry, 0, len(targets))
+
+	for _, target := range targets {
+		machines = append(machines, MachineEntry{
+			Name:                 target.Name,
+			MacAddress:           target.MacAddress,
+			BroadcastIP:          target.BroadcastIP,
+			WolPort:              target.WolPort,
+			HealthCheck:          target.HealthEndpoint,
+			SSHHost:              target.SSHHost,
+			SSHUser:              target.SSHUser,
+			SSHKeyPath:           target.SSHKeyPath,
+			ShutdownCommand:      target.ShutdownCommand,
+			ShutdownHTTPUrl:      target.ShutdownHTTPUrl,
+			ShutdownHTTPMethod:   target.ShutdownHTTPMethod,
+			ShutdownHTTPOKStatus: target.ShutdownHTTPOKStatus,
+			InactivityThreshold:  target.InactivityThreshold,
+		})
+		routes = append(routes, RouteEntry{
+			Machine:     target.Name,
+			Hostname:    target.Hostname,
+			Destination: target.Destination,
+			// A legacy health_endpoint gated both waking and forwarding, so it
+			// becomes the machine's liveness check and this route's readiness check.
+			HealthCheck: target.HealthEndpoint,
+		})
+	}
+
+	return machines, routes
+}
+
+// buildMachinesAndRoutes turns the machine and route blocks of a config file into
+// the runtime model: one Machine per machine block, shared by every route that
+// names it.
+// validateDestination rejects a destination that cannot work for its route kind, at
+// load time rather than on the first connection. A TCP route dials the string
+// directly, so it must be host:port. An HTTP route builds a reverse proxy from it,
+// and url.Parse accepts far too much: "nas.local:2342" parses as scheme "nas.local"
+// with opaque body "2342" — dots are legal in scheme names — yielding a proxy that
+// 502s every request with nothing in the logs to explain it.
+// validateHealthCheck rejects a check the checker cannot actually perform. Check
+// dispatches on the scheme — tcp:// dials, anything else is handed to an HTTP client
+// — so a bare "nas.local:22" parses as a URL with scheme "nas.local" and fails every
+// time, leaving the machine permanently unhealthy exactly as an empty value would.
+func validateHealthCheck(label, value string) error {
+	if address, ok := strings.CutPrefix(value, tcpScheme); ok {
+		if _, _, err := net.SplitHostPort(address); err != nil {
+			return fmt.Errorf("%s: health check %q must be tcp://host:port: %w", label, value, err)
+		}
+		return nil
+	}
+
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return fmt.Errorf("%s: invalid health check %q: %w", label, value, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf(
+			"%s: health check %q must be a tcp://, http:// or https:// URL", label, value)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("%s: health check %q has no host", label, value)
+	}
+	return nil
+}
+
+func validateDestination(name, destination string, isTCP bool) error {
+	if strings.TrimSpace(destination) == "" {
+		return fmt.Errorf("route %s needs a destination", name)
+	}
+
+	if isTCP {
+		if _, _, err := net.SplitHostPort(destination); err != nil {
+			return fmt.Errorf("route %s forwards raw TCP, so destination %q must be host:port: %w",
+				name, destination, err)
+		}
+		return nil
+	}
+
+	parsed, err := url.Parse(destination)
+	if err != nil {
+		return fmt.Errorf("route %s: invalid destination %q: %w", name, destination, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("route %s proxies HTTP, so destination %q must be an http:// or https:// URL",
+			name, destination)
+	}
+	if parsed.Host == "" {
+		return fmt.Errorf("route %s: destination %q has no host", name, destination)
+	}
+	return nil
+}
+
+func buildMachinesAndRoutes(machineEntries []MachineEntry, routeEntries []RouteEntry, clock Clock, fromLegacy bool) (routing, error) {
+	machines := make(map[string]*Machine)
+	routes := make([]*Route, 0, len(routeEntries))
+	routesByHostname := make(map[string]*Route)
+	routesByListenPort := make(map[int]*Route)
+	var err error
+
+	for _, entry := range machineEntries {
+		if entry.Name == "" {
+			return routing{}, fmt.Errorf("every machine needs a name")
+		}
+		if _, exists := machines[entry.Name]; exists {
+			return routing{}, fmt.Errorf("duplicate machine name %q", entry.Name)
+		}
+
+		// Liveness drives waking, the wake wait and the shutdown decision. Without it
+		// every Check fails, the machine is permanently unhealthy, and every request
+		// sprays WOL for the whole timeout before returning 503. Name the key the
+		// operator actually wrote, which differs in the legacy format.
+		if strings.TrimSpace(entry.HealthCheck) == "" {
+			key := "health_check"
+			if fromLegacy {
+				key = "health_endpoint"
+			}
+			return routing{}, fmt.Errorf(
+				"machine %s needs a %s: it is how the proxy tells whether the box is up",
+				entry.Name, key)
+		}
+		if err := validateHealthCheck("machine "+entry.Name, entry.HealthCheck); err != nil {
+			return routing{}, err
+		}
+
+		// Disallow using both SSH shutdown command and HTTP shutdown URL
+		if strings.TrimSpace(entry.ShutdownHTTPUrl) != "" && strings.TrimSpace(entry.ShutdownCommand) != "" {
+			return routing{}, fmt.Errorf("machine %s: cannot define both shutdown_http_url and shutdown_command; choose one", entry.Name)
+		}
+
+		// Disallow http method/ok status without URL
+		if strings.TrimSpace(entry.ShutdownHTTPUrl) == "" && (strings.TrimSpace(entry.ShutdownHTTPMethod) != "" || entry.ShutdownHTTPOKStatus != 0) {
+			return routing{}, fmt.Errorf("machine %s: shutdown_http_method and/or shutdown_http_ok_status require shutdown_http_url to be set", entry.Name)
+		}
+
+		var inactivityThreshold time.Duration
+		if entry.InactivityThreshold != "" {
+			inactivityThreshold, err = time.ParseDuration(entry.InactivityThreshold)
+			if err != nil {
+				return routing{}, fmt.Errorf("invalid inactivity_threshold for machine %s: %w", entry.Name, err)
+			}
+		}
+
+		var wakeTimeout time.Duration
+		if entry.WakeTimeout != "" {
+			wakeTimeout, err = time.ParseDuration(entry.WakeTimeout)
+			if err != nil {
+				return routing{}, fmt.Errorf("invalid wake_timeout for machine %s: %w", entry.Name, err)
+			}
+		}
+
+		var wakeHealthCheckInterval time.Duration
+		if entry.WakeHealthCheckInterval != "" {
+			wakeHealthCheckInterval, err = time.ParseDuration(entry.WakeHealthCheckInterval)
+			if err != nil {
+				return routing{}, fmt.Errorf("invalid wake_health_check_interval for machine %s: %w", entry.Name, err)
+			}
+		}
+
+		if entry.WolBurstCount != 0 && (entry.WolBurstCount < 1 || entry.WolBurstCount > 10) {
+			return routing{}, fmt.Errorf("wol_burst_count for machine %s must be between 1 and 10, got %d",
+				entry.Name, entry.WolBurstCount)
+		}
+
+		machines[entry.Name] = &Machine{
+			Name: entry.Name,
+			Config: &MachineConfig{
+				MacAddress:              entry.MacAddress,
+				BroadcastIP:             entry.BroadcastIP,
+				WolPort:                 entry.WolPort,
+				WolBurstCount:           entry.WolBurstCount,
+				WakeTimeout:             wakeTimeout,
+				WakeHealthCheckInterval: wakeHealthCheckInterval,
+				HealthCheck:             entry.HealthCheck,
+				SSHHost:                 entry.SSHHost,
+				SSHUser:                 entry.SSHUser,
+				SSHKeyPath:              entry.SSHKeyPath,
+				ShutdownCommand:         entry.ShutdownCommand,
+				ShutdownHTTPUrl:         entry.ShutdownHTTPUrl,
+				ShutdownHTTPMethod:      entry.ShutdownHTTPMethod,
+				ShutdownHTTPOKStatus:    entry.ShutdownHTTPOKStatus,
+				InactivityThreshold:     inactivityThreshold,
+			},
+			LastActivity: clock.Now(),
+		}
+	}
+
+	for _, entry := range routeEntries {
+		name := entry.Hostname
+		if name == "" {
+			name = fmt.Sprintf(":%d", entry.ListenPort)
+		}
+
+		switch {
+		case entry.Hostname == "" && entry.ListenPort == 0:
+			return routing{}, fmt.Errorf("route for machine %q needs either a hostname or a listen_port", entry.Machine)
+		case entry.Hostname != "" && entry.ListenPort != 0:
+			return routing{}, fmt.Errorf("route %s sets both hostname and listen_port; a route is reached one way or the other", name)
+		}
+
+		if existing, exists := routesByHostname[entry.Hostname]; exists {
+			return routing{}, fmt.Errorf("duplicate hostname %s for routes to machines %s and %s",
+				entry.Hostname, existing.Machine.Name, entry.Machine)
+		}
+		if existing, exists := routesByListenPort[entry.ListenPort]; exists {
+			return routing{}, fmt.Errorf("duplicate listen_port %d for routes to machines %s and %s",
+				entry.ListenPort, existing.Machine.Name, entry.Machine)
+		}
+
+		machine, exists := machines[entry.Machine]
+		if !exists {
+			return routing{}, fmt.Errorf("route %s references undefined machine %q", name, entry.Machine)
+		}
+
+		// Validate regardless of whether health_check was given: deriving the check
+		// from the destination used to be the only thing that looked at it, so an
+		// explicit health_check silently bought a pass on a broken destination.
+		if err := validateDestination(name, entry.Destination, entry.ListenPort != 0); err != nil {
+			return routing{}, err
+		}
+
+		healthCheck := entry.HealthCheck
+		if healthCheck == "" {
+			healthCheck, err = defaultHealthCheckForDestination(entry.Destination)
+			if err != nil {
+				return routing{}, fmt.Errorf("route %s: %w", name, err)
+			}
+		} else if err := validateHealthCheck("route "+name, healthCheck); err != nil {
+			// Only an explicit check can be malformed; a derived one is always
+			// tcp://host:port by construction.
+			return routing{}, err
+		}
+
+		route := &Route{
+			Name:        name,
+			Machine:     machine,
+			Hostname:    entry.Hostname,
+			ListenPort:  entry.ListenPort,
+			Destination: entry.Destination,
+			HealthCheck: healthCheck,
+		}
+		routes = append(routes, route)
+		if route.IsTCP() {
+			routesByListenPort[route.ListenPort] = route
+		} else {
+			routesByHostname[route.Hostname] = route
+		}
+	}
+
+	return routing{machines: machines, routes: routes, byHostname: routesByHostname, byListenPort: routesByListenPort}, nil
 }
 
 // Simple logger implementation
-type StdLogger struct {
-	level    LogLevel
-	location *time.Location
-}
-
-func (l *StdLogger) shouldLog(level LogLevel) bool {
-	return l.level <= level
-}
+type StdLogger struct{}
 
 func (l *StdLogger) Info(msg string, args ...interface{}) {
-	if l.shouldLog(LogLevelInfo) {
-		log.Printf("[INFO] %s "+msg, append([]interface{}{time.Now().In(l.location).Format("2006-01-02 15:04:05")}, args...)...)
-	}
+	log.Printf("[INFO] "+msg, args...)
 }
 
 func (l *StdLogger) Error(msg string, args ...interface{}) {
-	if l.shouldLog(LogLevelError) {
-		log.Printf("[ERROR] %s "+msg, append([]interface{}{time.Now().In(l.location).Format("2006-01-02 15:04:05")}, args...)...)
-	}
+	log.Printf("[ERROR] "+msg, args...)
 }
 
 func (l *StdLogger) Debug(msg string, args ...interface{}) {
-	if l.shouldLog(LogLevelDebug) {
-		log.Printf("[DEBUG] %s "+msg, append([]interface{}{time.Now().In(l.location).Format("2006-01-02 15:04:05")}, args...)...)
+	log.Printf("[DEBUG] "+msg, args...)
+}
+
+func logStartup(logger Logger, version string) {
+	logger.Info("Starting doormouse version `%s`", version)
+}
+
+// warnUnreadableSSHKeys reports SSH keys the process cannot open. The key is
+// otherwise read only when a machine has gone idle, so a permissions mistake
+// stays invisible until the first shutdown silently fails, up to an
+// inactivity_threshold later. Only a warning: a machine may never go idle, and
+// refusing to start would take the proxy down over a path it may never use.
+func warnUnreadableSSHKeys(config *ProxyConfig, logger Logger) {
+	for name, machine := range config.Machines {
+		path := machine.Config.SSHKeyPath
+		if path == "" || machine.Config.ShutdownHTTPUrl != "" {
+			continue
+		}
+		// Non-blocking open prevents a FIFO from hanging startup, even if the
+		// path is replaced concurrently. Check the opened file, not the path.
+		file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		if err == nil {
+			var info os.FileInfo
+			info, err = file.Stat()
+			file.Close()
+			if err == nil && !info.Mode().IsRegular() {
+				err = fmt.Errorf("not a regular file")
+			}
+		}
+		if err != nil {
+			logger.Error("Machine %s: cannot read ssh_key_path %s (%v). Shutting this machine "+
+				"down over SSH will fail until the file is readable by the user doormouse runs as.", name, path, err)
+			continue
+		}
 	}
 }
 
 // Main function
 func main() {
+	logger := &StdLogger{}
+	logStartup(logger, version)
+
 	if len(os.Args) < 2 {
-		log.Fatal("Usage: wol-proxy <config.toml>")
+		log.Fatal("Usage: doormouse <config.toml>")
 	}
 
 	configFile := os.Args[1]
 
 	// Load configuration
-	config, err := LoadConfig(configFile)
+	clock := RealClock{}
+
+	MigrateConfigFile(configFile, logger)
+
+	config, err := LoadConfig(configFile, clock)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
+	warnUnreadableSSHKeys(config, logger)
+
 	// Initialize dependencies
-	tz := os.Getenv("TZ")
-	if tz == "" {
-		tz = "UTC"
-	}
-	loc, err := time.LoadLocation(tz)
-	if err != nil {
-		log.Printf("Invalid timezone %q, defaulting to UTC: %v", tz, err)
-		tz = "UTC"
-		loc = time.UTC
-	}
-	logger := &StdLogger{level: ParseLogLevel(config.LogLevel), location: loc}
-	healthChecker := NewHTTPHealthChecker(logger)
+	healthChecker := NewEndpointHealthChecker(logger, clock)
 	wolSender := NewUDPWOLSender(logger)
 	sshExecutor := NewDefaultSSHExecutor(logger)
 
 	var cache *CacheStore
 	if config.CacheEnabled {
-		cache = NewCacheStore(config.CacheRootPath, config.CacheTTL, config.CacheMaxResponseSize, config.CachePaths, logger)
+		cache = NewCacheStore(config.CacheRootPath, config.CacheTTL, config.CacheMaxResponseSize, config.CacheRoutes, logger)
 	}
 
 	// Create proxy service
-	proxy := NewProxyService(config, healthChecker, wolSender, sshExecutor, logger, cache)
+	proxy := NewProxyService(config, healthChecker, wolSender, sshExecutor, logger, clock, cache)
 
-	// Start the service with graceful shutdown on SIGINT/SIGTERM
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func() {
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-		select {
-		case sig := <-sigChan:
-			log.Printf("Received signal %v, initiating graceful shutdown", sig)
-		case <-ctx.Done():
-			return
-		}
-		cancel()
-	}()
+	// Start the service, shutting down cleanly on SIGINT/SIGTERM
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	if err := proxy.Start(ctx); err != nil {
 		log.Fatalf("Failed to start proxy: %v", err)
 	}
+
+	logger.Info("Shut down cleanly")
 }
