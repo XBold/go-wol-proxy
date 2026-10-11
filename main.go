@@ -101,6 +101,7 @@ type Config struct {
 	SSLCertificate        string      `toml:"ssl_certificate"`
 	SSLCertificateKey     string      `toml:"ssl_certificate_key"`
 	LogLevel              string      `toml:"log_level"`
+	ClientHostnameLookup  *bool       `toml:"client_hostname_lookup"`
 	Targets               []Target    `toml:"targets"`
 	CacheConfig           CacheConfig `toml:"cache"`
 }
@@ -151,6 +152,7 @@ type ProxyConfig struct {
 	HealthCheckInterval   time.Duration
 	HealthCacheDuration   time.Duration
 	LogLevel              string
+	ClientHostnameLookup  bool
 	Targets               map[string]*TargetState
 	HostnameMap           map[string]string        // hostname -> target name
 	InactivityThresholds  map[string]time.Duration // target name -> inactivity threshold
@@ -955,6 +957,7 @@ type ProxyService struct {
 	wolSender      WOLSender
 	sshExecutor    SSHExecutor
 	logger         Logger
+	clientResolver *clientResolver
 	cache          *CacheStore
 	proxyTransport *http.Transport
 }
@@ -999,6 +1002,7 @@ func NewProxyService(
 		wolSender:      wolSender,
 		sshExecutor:    sshExecutor,
 		logger:         logger,
+		clientResolver: newClientResolver(config.ClientHostnameLookup),
 		cache:          cache,
 		proxyTransport: proxyTransport,
 	}
@@ -1276,13 +1280,14 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 	targetName := p.extractTarget(r)
 
 	if targetName == "" {
-		p.logger.Error("No target found for hostname: %s", r.Host)
+		p.logger.Error("No target found for hostname: %s (%s)", r.Host, p.describeClient(r))
 		http.Error(w, "No target configured for this hostname", http.StatusNotFound)
 		return
 	}
 
-	p.logger.Info("Incoming request for hostname: %s -> target: %s, path: %s (client: %s)",
-		r.Host, targetName, r.URL.Path, r.RemoteAddr)
+	clientDesc := p.describeClient(r)
+	p.logger.Info("Incoming request: host: %s -> target: %s, path: %s, method: %s (%s)",
+		r.Host, targetName, r.URL.Path, r.Method, clientDesc)
 
 	targetState, exists := p.config.Targets[targetName]
 	if !exists {
@@ -1327,8 +1332,8 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 			// runs independently of this request (see wakeAndWait), so the
 			// target will still be confirmed (and the cache refreshed) in the
 			// background; only this client gets no response.
-			p.logger.Info("Client %s disconnected while waiting for %s to wake (%v)",
-				r.RemoteAddr, targetName, err)
+			p.logger.Info("Client disconnected while waiting for %s to wake: %v (%s)",
+				targetName, err, clientDesc)
 			return
 		}
 		p.logger.Error("Failed to wake target %s: %v", targetName, err)
@@ -1339,8 +1344,8 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 	if err := r.Context().Err(); err != nil {
 		// The wake completed in the background but the client no longer wants
 		// the response. The next request will hit the now-healthy target.
-		p.logger.Info("Client %s disconnected while %s was waking; aborting request",
-			r.RemoteAddr, targetName)
+		p.logger.Info("Client disconnected while %s was waking; aborting request (%s)",
+			targetName, clientDesc)
 		return
 	}
 
@@ -1851,6 +1856,12 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 	config.SSLCertificate = strings.TrimSpace(config.SSLCertificate)
 	config.SSLCertificateKey = strings.TrimSpace(config.SSLCertificateKey)
 
+	// client_hostname_lookup is optional; unset means enabled
+	clientHostnameLookup := true
+	if config.ClientHostnameLookup != nil {
+		clientHostnameLookup = *config.ClientHostnameLookup
+	}
+
 	// Set defaults
 	if config.Port == "" {
 		config.Port = ":8080"
@@ -2072,6 +2083,7 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		HealthCheckInterval:   healthCheckInterval,
 		HealthCacheDuration:   healthCacheDuration,
 		LogLevel:              config.LogLevel,
+		ClientHostnameLookup:  clientHostnameLookup,
 		Targets:               targets,
 		HostnameMap:           hostnameMap,
 		InactivityThresholds:  inactivityThresholds,
@@ -2084,6 +2096,173 @@ func LoadConfig(filename string) (*ProxyConfig, error) {
 		CacheWarmInterval:     cacheWarmInterval,
 		CachePaths:            cachePaths,
 	}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Client identification
+// ---------------------------------------------------------------------------
+
+// clientResolver performs best-effort reverse DNS lookups for client IPs so
+// that incoming requests can be logged with the client's hostname when the
+// network provides PTR records. Results (including failures) are cached, so
+// each unique IP triggers at most one lookup per TTL window.
+type clientResolver struct {
+	enabled  bool
+	ttl      time.Duration // how long a successful lookup is trusted
+	negTTL   time.Duration // how long a failed lookup is remembered
+	timeout  time.Duration // max wait for a single lookup
+	lookupFn func(ip string, timeout time.Duration) (string, error)
+
+	mu    sync.RWMutex
+	cache map[string]clientHostEntry
+}
+
+type clientHostEntry struct {
+	hostname   string // empty for failed lookups
+	resolvedAt time.Time
+}
+
+func newClientResolver(enabled bool) *clientResolver {
+	return &clientResolver{
+		enabled:  enabled,
+		ttl:      30 * time.Minute,
+		negTTL:   2 * time.Minute,
+		timeout:  time.Second,
+		lookupFn: lookupClientAddr,
+		cache:    make(map[string]clientHostEntry),
+	}
+}
+
+// resolve returns the reverse DNS hostname for ip, or ("", false) when no
+// name is known (or when the resolver is disabled). A lookup never blocks
+// longer than r.timeout.
+func (r *clientResolver) resolve(ip string) (string, bool) {
+	if !r.enabled || ip == "" {
+		return "", false
+	}
+	if host, ok := r.cached(ip); ok {
+		return host, host != ""
+	}
+
+	host, err := r.lookupFn(ip, r.timeout)
+	if err != nil {
+		r.store(ip, "")
+		return "", false
+	}
+	host = strings.TrimSuffix(host, ".") // drop FQDN trailing dot
+	r.store(ip, host)
+	return host, true
+}
+
+func (r *clientResolver) cached(ip string) (string, bool) {
+	r.mu.RLock()
+	entry, ok := r.cache[ip]
+	r.mu.RUnlock()
+	if !ok {
+		return "", false
+	}
+	ttl := r.ttl
+	if entry.hostname == "" {
+		ttl = r.negTTL
+	}
+	if time.Since(entry.resolvedAt) > ttl {
+		return "", false
+	}
+	return entry.hostname, true
+}
+
+func (r *clientResolver) store(ip, host string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Prune expired entries as a safety net for long-running processes so
+	// the cache stays bounded even with many distinct client IPs.
+	if len(r.cache) > 8192 {
+		now := time.Now()
+		for k, e := range r.cache {
+			ttl := r.ttl
+			if e.hostname == "" {
+				ttl = r.negTTL
+			}
+			if now.Sub(e.resolvedAt) > ttl {
+				delete(r.cache, k)
+			}
+		}
+	}
+	r.cache[ip] = clientHostEntry{hostname: host, resolvedAt: time.Now()}
+}
+
+// lookupClientAddr performs a reverse DNS lookup with a hard timeout.
+// net.LookupAddr does not accept a context, so it runs in a goroutine and
+// the deadline is enforced with time.After; a timed-out lookup is reported
+// as an error and the goroutine finishes on its own.
+func lookupClientAddr(ip string, timeout time.Duration) (string, error) {
+	type result struct {
+		names []string
+		err   error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		names, err := net.LookupAddr(ip)
+		ch <- result{names, err}
+	}()
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			return "", res.err
+		}
+		for _, name := range res.names {
+			if name != "" {
+				return name, nil
+			}
+		}
+		return "", fmt.Errorf("no PTR record for %s", ip)
+	case <-time.After(timeout):
+		return "", fmt.Errorf("reverse lookup for %s timed out after %s", ip, timeout)
+	}
+}
+
+// clientIP extracts the bare IP from an "ip:port" remote address.
+func clientIP(remoteAddr string) string {
+	ip, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return ip
+}
+
+// describeClient renders what is known about the sender of a request. The
+// source address is always present; the reverse-DNS hostname, the
+// User-Agent and common proxy headers (X-Forwarded-For, X-Real-IP,
+// X-Forwarded-Host) are added when available so the logs make it clear
+// which service or machine the request came from.
+func (p *ProxyService) describeClient(r *http.Request) string {
+	parts := []string{"client: " + r.RemoteAddr}
+
+	if host, ok := p.clientResolver.resolve(clientIP(r.RemoteAddr)); ok {
+		parts = append(parts, "hostname: "+host)
+	}
+	if ua := r.UserAgent(); ua != "" {
+		parts = append(parts, fmt.Sprintf("user-agent: %q", truncate(ua, 200)))
+	}
+	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+		parts = append(parts, "x-forwarded-for: "+v)
+	}
+	if v := r.Header.Get("X-Real-IP"); v != "" {
+		parts = append(parts, "x-real-ip: "+v)
+	}
+	if v := r.Header.Get("X-Forwarded-Host"); v != "" {
+		parts = append(parts, "x-forwarded-host: "+v)
+	}
+	return strings.Join(parts, " ")
+}
+
+// truncate shortens s to at most n runes, appending an ellipsis when cut.
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 // Simple logger implementation

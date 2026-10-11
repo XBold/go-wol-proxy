@@ -7,6 +7,10 @@ request_timeout = "0"           # HTTP ReadTimeout: 0 = no timeout (useful for S
 health_check_interval = "30s"   # Background health check frequency
 health_cache_duration = "10s"   # How long to trust cached health status
 log_level = "info"              # Log level: debug, info, warn, error
+# Best-effort reverse DNS lookup of client IPs so request logs include the
+# client's hostname when the network provides PTR records. Set to false to
+# skip the lookup entirely (e.g. if your DNS server has no reverse records).
+client_hostname_lookup = true
 
 # Cache configuration (optional)
 # When the destination is offline, cached responses are served instead of triggering WOL

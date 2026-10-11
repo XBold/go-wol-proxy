@@ -25,6 +25,9 @@ response_timeout = "0"          # HTTP server write timeout (responses to client
 request_timeout = "0"           # HTTP server read timeout (requests from clients): 0 = no timeout, keep 0 for long SSE streams
 health_check_interval = "30s"   # Background health check frequency
 health_cache_duration = "10s"   # How long to trust cached health status
+log_level = "info"              # Log level: debug, info, warn, error
+# Best-effort reverse DNS lookup of client IPs in request logs (enabled by default)
+client_hostname_lookup = true   # Set to false to skip reverse DNS lookups
 
 # Static response cache - serves cached content when destinations are offline
 # Prevents unnecessary WOL triggers for cached paths
@@ -81,6 +84,21 @@ mac_address = "c9:69:45:d2:1e:12"
 broadcast_ip = "10.0.0.255"
 wol_port = 9
 ```
+
+## Request Logging
+
+Every incoming request is logged with everything the proxy knows about its sender, so you can tell which service or machine made it:
+
+```
+[INFO] 2026-10-06 04:01:03 Incoming request: host: 192.168.50.80:9100 -> target: llamacpp, path: /v1/chat/completions, method: POST (client: 172.23.0.3:57648 hostname: open-webui user-agent: "openai-python/1.59.3" x-forwarded-for: 192.168.50.15)
+```
+
+- `client` - source IP and port (always present)
+- `hostname` - reverse DNS (PTR) lookup of the client IP, when the network provides one. Results are cached (30 min for names, 2 min for failures) and a lookup never blocks a request for more than 1 second.
+- `user-agent` - the client's User-Agent header, when sent. This is usually the most reliable hint about *which service* made the request (e.g. `openai-python`, `okhttp`, `curl`, a browser, ...)
+- `x-forwarded-for` / `x-real-ip` / `x-forwarded-host` - included when present. These carry the original client address when the request arrives via another proxy
+
+Note: Docker container IPs (e.g. `172.23.0.3`) have no PTR record by default, so `hostname` will usually be absent for them - the `user-agent` is your best clue there.
 
 ## Docker Usage
 
