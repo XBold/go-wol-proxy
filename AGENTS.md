@@ -1,3 +1,9 @@
+# GitHub Interactions
+
+**IMPORTANT:** Always use the GitHub MCP server as the FIRST method for any GitHub-related information (repositories, issues, pull requests, commits, releases, branches, code search, PR reviews, etc.).
+- Only fall back to other methods (gh CLI, web fetch, git) if the GitHub MCP tools are unavailable or fail.
+- This applies to reading upstream repo state, issue/PR research, and remote branch comparisons.
+
 # Branch Strategy
 
 ## Branch Usage
