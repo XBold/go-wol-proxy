@@ -3,7 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -43,6 +47,7 @@ type SSHExecutor interface {
 type Logger interface {
 	Info(msg string, args ...interface{})
 	Error(msg string, args ...interface{})
+	Debug(msg string, args ...interface{})
 }
 
 const tcpScheme = "tcp://"
@@ -116,6 +121,7 @@ type Config struct {
 	HealthCacheDuration   string         `toml:"health_cache_duration"`
 	SSLCertificate        string         `toml:"ssl_certificate,omitempty"`
 	SSLCertificateKey     string         `toml:"ssl_certificate_key,omitempty"`
+	CacheConfig           CacheConfig    `toml:"cache,omitempty"`
 	Targets               []Target       `toml:"targets,omitempty"` // legacy, superseded by machines + routes
 	Machines              []MachineEntry `toml:"machines,omitempty"`
 	Routes                []RouteEntry   `toml:"routes,omitempty"`
@@ -145,6 +151,25 @@ type RouteEntry struct {
 	ListenPort  int    `toml:"listen_port,omitempty"`
 	Destination string `toml:"destination,omitempty"`
 	HealthCheck string `toml:"health_check,omitempty"`
+}
+
+// CacheConfig is the optional [cache] block. When a machine is offline, GET
+// responses for the configured paths are served from disk instead of waking
+// it: the client gets a full answer while the box stays asleep, and the
+// cache is refreshed again once the machine is reachable.
+type CacheConfig struct {
+	Enabled              bool               `toml:"enabled"`
+	RootPath             string             `toml:"root_path,omitempty"`
+	TTL                  string             `toml:"ttl,omitempty"`
+	MaxResponseSizeBytes int64              `toml:"max_response_size_bytes,omitempty"`
+	WarmInterval         string             `toml:"warm_interval,omitempty"`
+	Routes               []CacheRouteConfig `toml:"routes,omitempty"`
+}
+
+// CacheRouteConfig is a [[cache.routes]] block: the paths cached for one route.
+type CacheRouteConfig struct {
+	Route string   `toml:"route"`
+	Paths []string `toml:"paths"`
 }
 
 type Target struct {
@@ -228,6 +253,12 @@ type ProxyConfig struct {
 	RoutesByListenPort    map[int]*Route
 	SSLCertificate        string
 	SSLCertificateKey     string
+	CacheEnabled          bool
+	CacheRootPath         string
+	CacheTTL              time.Duration
+	CacheMaxResponseSize  int64
+	CacheWarmInterval     time.Duration
+	CacheRoutes           map[string][]string // route name -> cached path patterns
 }
 
 type Machine struct {
@@ -268,6 +299,469 @@ func (m *Machine) releaseConnection(now time.Time) {
 	}
 	m.LastActivity = now
 	m.mu.Unlock()
+}
+
+// ---------------------------------------------------------------------------
+// Static response cache
+// ---------------------------------------------------------------------------
+
+type cacheEntry struct {
+	StatusCode int                 `json:"status_code"`
+	Headers    map[string][]string `json:"headers"`
+	Body       []byte              `json:"-"`
+	Timestamp  time.Time           `json:"timestamp"`
+	Path       string              `json:"path"`
+}
+
+// CacheStore persists GET responses for configured route paths on disk so
+// they can be served while the machine behind the route is asleep.
+type CacheStore struct {
+	rootPath    string
+	ttl         time.Duration
+	maxSize     int64
+	logger      Logger
+	entriesMu   sync.RWMutex
+	entries     map[string]*cacheEntry
+	routePaths  map[string][]string // route name -> list of patterns
+	keyToRoute  map[string]string   // cache key -> route name
+	keyToPath   map[string]string   // cache key -> path
+	accessOrder []string
+	maxEntries  int
+	lastHashes  map[string][]byte // cache key -> last SHA-256 hash of body
+}
+
+func NewCacheStore(rootPath string, ttl time.Duration, maxSize int64, routePaths map[string][]string, logger Logger) *CacheStore {
+	cs := &CacheStore{
+		rootPath:    rootPath,
+		ttl:         ttl,
+		maxSize:     maxSize,
+		logger:      logger,
+		entries:     make(map[string]*cacheEntry),
+		routePaths:  routePaths,
+		keyToRoute:  make(map[string]string),
+		keyToPath:   make(map[string]string),
+		accessOrder: []string{},
+		maxEntries:  1000,
+		lastHashes:  make(map[string][]byte),
+	}
+
+	if err := os.MkdirAll(rootPath, 0755); err != nil {
+		logger.Error("Failed to create cache directory %s: %v", rootPath, err)
+	}
+
+	cs.loadAll()
+
+	return cs
+}
+
+func (cs *CacheStore) key(routeName, urlPath string) string {
+	hash := sha256.Sum256([]byte(routeName + urlPath))
+	return fmt.Sprintf("%x", hash[:16])
+}
+
+func (cs *CacheStore) cacheFilePath(routeName, urlPath string) string {
+	return filepath.Join(cs.rootPath, routeName, cs.key(routeName, urlPath)+".cache")
+}
+
+func (cs *CacheStore) load(routeName, urlPath string) (*cacheEntry, bool) {
+	// urlPath is a URL path: always slash-separated, so clean it with
+	// path.Clean rather than filepath.Clean, which would rewrite separators
+	// on Windows and desynchronize keys from the request paths that produced
+	// them.
+	urlPath = path.Clean(urlPath)
+	if urlPath == "." || urlPath == "" {
+		return nil, false
+	}
+
+	cacheFile := cs.cacheFilePath(routeName, urlPath)
+
+	data, err := os.ReadFile(cacheFile)
+	if err != nil {
+		return nil, false
+	}
+
+	var entry cacheEntry
+	if meta, body, ok := parseCacheEnvelope(data); ok && meta.Path == urlPath {
+		entry = meta
+		entry.Body = body
+	} else {
+		// Legacy two-file layout: body in cacheFile, metadata in cacheFile+".meta"
+		metaData, err := os.ReadFile(cacheFile + ".meta")
+		if err != nil {
+			return nil, false
+		}
+		if err := json.Unmarshal(metaData, &entry); err != nil {
+			return nil, false
+		}
+		entry.Body = data
+	}
+
+	if time.Since(entry.Timestamp) > cs.ttl {
+		os.Remove(cacheFile)
+		os.Remove(cacheFile + ".meta")
+		return nil, false
+	}
+
+	cs.entriesMu.Lock()
+	k := cs.key(routeName, urlPath)
+	if _, exists := cs.entries[k]; !exists {
+		cs.entries[k] = &entry
+		cs.keyToRoute[k] = routeName
+		cs.keyToPath[k] = urlPath
+		cs.addToAccessOrder(k)
+	}
+	cs.entriesMu.Unlock()
+
+	return &entry, true
+}
+
+func (cs *CacheStore) Save(routeName, urlPath string, statusCode int, headers http.Header, body []byte) {
+	urlPath = path.Clean(urlPath)
+	if urlPath == "." || urlPath == "" {
+		return
+	}
+
+	if int64(len(body)) > cs.maxSize {
+		cs.logger.Error("Response too large for cache (%d bytes) for %s %s", len(body), routeName, urlPath)
+		return
+	}
+
+	bodyHash := sha256.Sum256(body)
+	cacheFile := cs.cacheFilePath(routeName, urlPath)
+
+	cs.entriesMu.Lock()
+	k := cs.key(routeName, urlPath)
+	if lastHash, exists := cs.lastHashes[k]; exists && bytes.Equal(lastHash, bodyHash[:]) {
+		// Unchanged content only allows skipping the write while the cache
+		// file is still on disk: the file can disappear independently of
+		// lastHashes (TTL expiry in load, manual cleanup, ...). Skipping the
+		// write in that case would leave the cache empty forever for
+		// unchanged responses (e.g. a static model list), sending WOL on
+		// every offline request.
+		if _, err := os.Stat(cacheFile); err == nil {
+			cs.entriesMu.Unlock()
+			cs.logger.Debug("Cache unchanged for %s %s, skipping write", routeName, urlPath)
+			return
+		}
+	}
+	cs.entriesMu.Unlock()
+
+	cacheDir := filepath.Join(cs.rootPath, routeName)
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
+		cs.logger.Error("Failed to create cache directory %s: %v", cacheDir, err)
+		return
+	}
+
+	meta := &cacheEntry{
+		StatusCode: statusCode,
+		Headers:    sanitizeCachedHeaders(headers),
+		Body:       body,
+		Timestamp:  time.Now(),
+		Path:       urlPath,
+	}
+
+	// The on-disk entry is a single file:
+	//
+	//	[4]byte metadata length (little-endian) | metadata JSON | body
+	//
+	// Publishing it takes one atomic rename, so a concurrent reader can
+	// never observe a body without its metadata. With the older two-file
+	// layout there was a window between the body rename and the metadata
+	// rename in which a request saw a cache miss and sent WOL for a
+	// response that was actually being cached.
+	metaData, err := json.Marshal(meta)
+	if err != nil {
+		cs.logger.Error("Failed to marshal cache metadata: %v", err)
+		return
+	}
+
+	envelope := make([]byte, 4, 4+len(metaData)+len(body))
+	binary.LittleEndian.PutUint32(envelope, uint32(len(metaData)))
+	envelope = append(envelope, metaData...)
+	envelope = append(envelope, body...)
+
+	if err := writeFileAtomic(cacheFile, envelope); err != nil {
+		cs.logger.Error("Failed to write cache file %s: %v", cacheFile, err)
+		return
+	}
+	// Drop a legacy metadata sidecar left behind by older versions.
+	os.Remove(cacheFile + ".meta")
+
+	cs.entriesMu.Lock()
+	cs.entries[k] = meta
+	cs.keyToRoute[k] = routeName
+	cs.keyToPath[k] = urlPath
+	cs.addToAccessOrder(k)
+	cs.lastHashes[k] = bodyHash[:]
+	cs.entriesMu.Unlock()
+
+	cs.logger.Info("Cache updated for %s %s", routeName, urlPath)
+}
+
+// hopByHopHeaders are connection-specific or framing headers that must not be
+// stored and replayed when a cached response is served from disk: the server
+// sending the cached response re-adds the correct framing (Content-Length or
+// chunking) for the actual body.
+var hopByHopHeaders = []string{
+	"Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"TE",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+	"Content-Length",
+}
+
+func sanitizeCachedHeaders(headers http.Header) http.Header {
+	sanitized := make(http.Header, len(headers))
+	for key, values := range headers {
+		skip := false
+		for _, hop := range hopByHopHeaders {
+			if strings.EqualFold(key, hop) {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+		sanitized[key] = values
+	}
+	return sanitized
+}
+
+// parseCacheEnvelope splits a single-file cache entry
+// ([4]byte metadata length (little-endian) | metadata JSON | body).
+// ok is false when data is not an envelope (e.g. a legacy two-file body), in
+// which case the caller falls back to the legacy layout.
+func parseCacheEnvelope(data []byte) (meta cacheEntry, body []byte, ok bool) {
+	if len(data) < 4 {
+		return
+	}
+	metaLen := int(binary.LittleEndian.Uint32(data[:4]))
+	if metaLen <= 0 || 4+metaLen > len(data) {
+		return
+	}
+	if err := json.Unmarshal(data[4:4+metaLen], &meta); err != nil {
+		return
+	}
+	if meta.Path == "" {
+		return
+	}
+	meta.Body = data[4+metaLen:]
+	body = meta.Body
+	ok = true
+	return
+}
+
+// writeFileAtomic writes data to a temp file in the same directory and renames
+// it into place, so readers never see a partially written file.
+func writeFileAtomic(filePath string, data []byte) error {
+	tmpFile := filePath + ".tmp"
+	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpFile, filePath); err != nil {
+		os.Remove(tmpFile)
+		return err
+	}
+	return nil
+}
+
+func (cs *CacheStore) Get(routeName, urlPath string) (*http.Response, bool) {
+	entry, ok := cs.load(routeName, urlPath)
+	if !ok {
+		return nil, false
+	}
+
+	resp := &http.Response{
+		StatusCode: entry.StatusCode,
+		Status:     http.StatusText(entry.StatusCode),
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header:     entry.Headers,
+		Body:       io.NopCloser(bytes.NewReader(entry.Body)),
+	}
+
+	return resp, true
+}
+
+func (cs *CacheStore) GetCachedPathsForRoute(routeName string) []string {
+	cs.entriesMu.RLock()
+	defer cs.entriesMu.RUnlock()
+
+	routePaths, exists := cs.routePaths[routeName]
+	if !exists || len(routePaths) == 0 {
+		return nil
+	}
+
+	var result []string
+	for _, pattern := range routePaths {
+		if strings.HasSuffix(pattern, "/*") {
+			prefix := strings.TrimSuffix(pattern, "/*")
+			for key := range cs.keyToPath {
+				if cs.keyToRoute[key] == routeName {
+					if p := cs.keyToPath[key]; p != "" && strings.HasPrefix(p, prefix) {
+						result = append(result, p)
+					}
+				}
+			}
+		} else {
+			result = append(result, pattern)
+		}
+	}
+
+	return result
+}
+
+func (cs *CacheStore) addToAccessOrder(key string) {
+	for i, k := range cs.accessOrder {
+		if k == key {
+			cs.accessOrder = append(cs.accessOrder[:i], cs.accessOrder[i+1:]...)
+			break
+		}
+	}
+	cs.accessOrder = append(cs.accessOrder, key)
+	for len(cs.accessOrder) > cs.maxEntries {
+		oldest := cs.accessOrder[0]
+		cs.accessOrder = cs.accessOrder[1:]
+		delete(cs.entries, oldest)
+		delete(cs.keyToRoute, oldest)
+		delete(cs.keyToPath, oldest)
+	}
+}
+
+func (cs *CacheStore) loadAll() {
+	routes := make(map[string]bool)
+	for routeName := range cs.routePaths {
+		routes[routeName] = true
+	}
+
+	for routeName := range routes {
+		dir := filepath.Join(cs.rootPath, routeName)
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+
+		for _, file := range files {
+			if file.IsDir() || !strings.HasSuffix(file.Name(), ".cache") {
+				continue
+			}
+
+			if strings.HasSuffix(file.Name(), ".meta.cache") {
+				continue
+			}
+
+			cacheFile := filepath.Join(dir, file.Name())
+
+			var entry cacheEntry
+			if metaData, err := os.ReadFile(cacheFile + ".meta"); err == nil {
+				// Legacy two-file layout: body in cacheFile, metadata in the
+				// ".meta" sidecar
+				if err := json.Unmarshal(metaData, &entry); err != nil {
+					continue
+				}
+				body, err := os.ReadFile(cacheFile)
+				if err != nil {
+					continue
+				}
+				entry.Body = body
+			} else {
+				// Single-file envelope layout
+				data, err := os.ReadFile(cacheFile)
+				if err != nil {
+					continue
+				}
+				if meta, body, ok := parseCacheEnvelope(data); !ok {
+					continue
+				} else {
+					entry = meta
+					entry.Body = body
+				}
+			}
+
+			if time.Since(entry.Timestamp) > cs.ttl {
+				os.Remove(cacheFile)
+				os.Remove(cacheFile + ".meta")
+				continue
+			}
+
+			k := file.Name()[:len(file.Name())-len(".cache")]
+			cs.entries[k] = &entry
+			cs.keyToRoute[k] = routeName
+			cs.keyToPath[k] = entry.Path
+			cs.addToAccessOrder(k)
+		}
+	}
+
+	cs.logger.Info("Loaded %d cache entries", len(cs.entries))
+}
+
+func (cs *CacheStore) Cleanup() {
+	cs.entriesMu.Lock()
+	defer cs.entriesMu.Unlock()
+
+	keysToRemove := []string{}
+
+	for k, entry := range cs.entries {
+		if time.Since(entry.Timestamp) > cs.ttl {
+			keysToRemove = append(keysToRemove, k)
+		}
+	}
+
+	for _, k := range keysToRemove {
+		routeName := cs.keyToRoute[k]
+		urlPath := cs.keyToPath[k]
+
+		delete(cs.entries, k)
+		delete(cs.keyToRoute, k)
+		delete(cs.keyToPath, k)
+		delete(cs.lastHashes, k)
+
+		// Also remove the expired files from disk, not just the in-memory bookkeeping.
+		if routeName != "" && urlPath != "" {
+			cacheFile := cs.cacheFilePath(routeName, urlPath)
+			os.Remove(cacheFile)
+			os.Remove(cacheFile + ".meta")
+		}
+	}
+
+	if len(keysToRemove) > 0 {
+		cs.logger.Info("Cleaned up %d expired cache entries", len(keysToRemove))
+	}
+}
+
+func (cs *CacheStore) Close() {
+	cs.Cleanup()
+}
+
+// catchingBody tees the proxied response body into a buffer and hands the
+// complete copy to onDone when the body is closed, so the cache is written
+// without buffering the whole response in front of the client.
+type catchingBody struct {
+	io.Reader
+	original io.ReadCloser
+	onDone   func()
+	closed   bool
+}
+
+func (cb *catchingBody) Close() error {
+	if cb.closed {
+		return nil
+	}
+	cb.closed = true
+
+	if cb.onDone != nil {
+		cb.onDone()
+	}
+	if cb.original != nil {
+		return cb.original.Close()
+	}
+	return nil
 }
 
 // Health checker: dispatches on the endpoint scheme — tcp:// dials, anything else is an HTTP GET
@@ -599,6 +1093,7 @@ type ProxyService struct {
 	sshExecutor   SSHExecutor
 	logger        Logger
 	clock         Clock
+	cache         *CacheStore
 }
 
 func NewProxyService(
@@ -608,6 +1103,7 @@ func NewProxyService(
 	sshExecutor SSHExecutor,
 	logger Logger,
 	clock Clock,
+	cache *CacheStore,
 ) *ProxyService {
 	return &ProxyService{
 		config:        config,
@@ -616,6 +1112,7 @@ func NewProxyService(
 		sshExecutor:   sshExecutor,
 		logger:        logger,
 		clock:         clock,
+		cache:         cache,
 	}
 }
 
@@ -733,6 +1230,130 @@ func (p *ProxyService) checkInactiveMachines() {
 	}
 }
 
+// warmMachine refreshes the cached paths of every HTTP route pointing at
+// machine, fetching each from the route's destination while it is reachable.
+func (p *ProxyService) warmMachine(machine *Machine) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	p.logger.Debug("Starting cache warmup for machine: %s", machine.Name)
+
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          10,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			DisableCompression:    true,
+		},
+	}
+
+	for _, route := range routesTo(machine, p.config.Routes) {
+		if route.IsTCP() {
+			continue
+		}
+
+		cachedPaths := p.cache.GetCachedPathsForRoute(route.Name)
+		if len(cachedPaths) == 0 {
+			continue
+		}
+
+		routeURL, err := url.Parse(route.Destination)
+		if err != nil {
+			continue
+		}
+
+		for _, path := range cachedPaths {
+			select {
+			case <-ctx.Done():
+				p.logger.Debug("Cache warmup cancelled for machine: %s", machine.Name)
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			reqURL := *routeURL
+			reqURL.Path = path
+
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL.String(), nil)
+			if err != nil {
+				p.logger.Error("Failed to create request for %s %s: %v", machine.Name, path, err)
+				continue
+			}
+
+			resp, err := client.Do(req)
+			if err != nil {
+				p.logger.Error("Failed to warm cache for %s %s: %v", machine.Name, path, err)
+				continue
+			}
+
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				body, err := io.ReadAll(io.LimitReader(resp.Body, p.config.CacheMaxResponseSize))
+				resp.Body.Close()
+
+				if err == nil {
+					p.cache.Save(route.Name, path, resp.StatusCode, resp.Header, body)
+				}
+			} else {
+				resp.Body.Close()
+			}
+		}
+	}
+
+	p.logger.Debug("Cache warmup completed for machine: %s", machine.Name)
+}
+
+func (p *ProxyService) startCacheCleanup(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.cache.Cleanup()
+		}
+	}
+}
+
+func (p *ProxyService) startCacheWarming(ctx context.Context) {
+	ticker := time.NewTicker(p.config.CacheWarmInterval)
+	defer ticker.Stop()
+
+	for _, machine := range p.config.Machines {
+		machine.mu.RLock()
+		isHealthy := machine.IsHealthy
+		machine.mu.RUnlock()
+		if isHealthy {
+			p.warmMachine(machine)
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, machine := range p.config.Machines {
+				machine.mu.RLock()
+				isHealthy := machine.IsHealthy
+				machine.mu.RUnlock()
+
+				if isHealthy {
+					p.warmMachine(machine)
+				}
+			}
+		}
+	}
+}
+
 func isSecureServer(config *ProxyConfig) bool {
 	return config.SSLCertificate != "" && config.SSLCertificateKey != ""
 }
@@ -754,6 +1375,13 @@ func (p *ProxyService) Start(ctx context.Context) error {
 
 	// Start background inactivity monitor
 	go p.startInactivityMonitor(ctx)
+
+	if p.cache != nil {
+		p.logger.Info("Cache enabled, root path: %s, TTL: %v, warm interval: %v",
+			p.config.CacheRootPath, p.config.CacheTTL, p.config.CacheWarmInterval)
+		go p.startCacheCleanup(ctx)
+		go p.startCacheWarming(ctx)
+	}
 
 	p.logger.Info("Initial health checks completed, starting HTTP server")
 
@@ -823,6 +1451,10 @@ func (p *ProxyService) Start(ctx context.Context) error {
 			firstErr = err
 			cancelServers()
 		}
+	}
+
+	if p.cache != nil {
+		p.cache.Close()
 	}
 	return firstErr
 }
@@ -912,6 +1544,25 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 		p.logger.Info("Machine %s is healthy, proxying immediately", machineName)
 		p.serveWhenReady(w, r, route)
 		return
+	}
+
+	// The machine looks down: before waking it, see whether the static cache
+	// can answer. A cached response means the client gets a full answer
+	// while the machine stays asleep.
+	if p.cache != nil && r.Method == http.MethodGet {
+		if resp, ok := p.cache.Get(route.Name, r.URL.Path); ok {
+			p.logger.Info("Serving cached response for %s %s (machine %s is down)",
+				r.Method, r.URL.Path, machineName)
+			for k, v := range resp.Header {
+				for _, header := range v {
+					w.Header().Add(k, header)
+				}
+			}
+			w.WriteHeader(resp.StatusCode)
+			io.Copy(w, resp.Body)
+			resp.Body.Close()
+			return
+		}
 	}
 
 	// Need to wake up the server
@@ -1122,6 +1773,19 @@ func (p *ProxyService) waitForWake(ctx context.Context, machine *Machine) error 
 				wakeDuration := p.clock.Now().Sub(wakeStartTime)
 				p.logger.Info("Machine %s woke up after %v",
 					machine.Name, wakeDuration)
+
+				if p.cache != nil {
+					// Refresh the cached paths now that the machine is
+					// reachable again. Only invalidating the cache and
+					// relying on the next warm tick (up to warm_interval
+					// later) or a future proxied GET to repopulate it means
+					// a machine that sleeps again before either happens
+					// falls back to triggering WOL on every cached request.
+					// Refreshing in place (instead of deleting first) also
+					// keeps the previous entries servable if the refresh
+					// itself fails.
+					go p.warmMachine(machine)
+				}
 				return nil
 			}
 		}
@@ -1314,6 +1978,41 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, rout
 	proxy.ModifyResponse = func(resp *http.Response) error {
 		p.logger.Info("Response from %s: status=%d, content-length=%d",
 			route.Name, resp.StatusCode, resp.ContentLength)
+
+		if p.cache != nil && r.Method == http.MethodGet && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			cachePaths, exists := p.config.CacheRoutes[route.Name]
+			if exists {
+				var shouldCache bool
+				for _, pattern := range cachePaths {
+					if strings.HasSuffix(pattern, "/*") {
+						prefix := strings.TrimSuffix(pattern, "/*")
+						if strings.HasPrefix(r.URL.Path, prefix) {
+							shouldCache = true
+							break
+						}
+					} else if r.URL.Path == pattern {
+						shouldCache = true
+						break
+					}
+				}
+
+				if shouldCache {
+					buf := &bytes.Buffer{}
+					tee := io.TeeReader(resp.Body, buf)
+					resp.Body = &catchingBody{
+						Reader:   tee,
+						original: resp.Body,
+						onDone: func() {
+							body := buf.Bytes()
+							if int64(len(body)) <= p.config.CacheMaxResponseSize {
+								p.cache.Save(route.Name, r.URL.Path, resp.StatusCode, resp.Header, body)
+							}
+						},
+					}
+				}
+			}
+		}
+
 		return nil
 	}
 
@@ -1411,6 +2110,46 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 		return nil, fmt.Errorf("invalid health_cache_duration: %w", err)
 	}
 
+	var cacheEnabled bool
+	var cacheRootPath string
+	var cacheTTL time.Duration
+	var cacheMaxResponseSize int64
+	var cacheWarmInterval time.Duration
+	cacheRoutes := make(map[string][]string)
+
+	if config.CacheConfig.Enabled {
+		cacheEnabled = true
+		cacheRootPath = config.CacheConfig.RootPath
+		if cacheRootPath == "" {
+			cacheRootPath = "./cache"
+		}
+
+		cacheTTL = 24 * time.Hour
+		if config.CacheConfig.TTL != "" {
+			cacheTTL, err = time.ParseDuration(config.CacheConfig.TTL)
+			if err != nil {
+				return nil, fmt.Errorf("invalid cache ttl: %w", err)
+			}
+		}
+
+		cacheMaxResponseSize = 10 * 1024 * 1024
+		if config.CacheConfig.MaxResponseSizeBytes > 0 {
+			cacheMaxResponseSize = config.CacheConfig.MaxResponseSizeBytes
+		}
+
+		cacheWarmInterval = 30 * time.Minute
+		if config.CacheConfig.WarmInterval != "" {
+			cacheWarmInterval, err = time.ParseDuration(config.CacheConfig.WarmInterval)
+			if err != nil {
+				return nil, fmt.Errorf("invalid cache warm_interval: %w", err)
+			}
+		}
+
+		for _, cr := range config.CacheConfig.Routes {
+			cacheRoutes[cr.Route] = cr.Paths
+		}
+	}
+
 	if len(config.Targets) > 0 && (len(config.Machines) > 0 || len(config.Routes) > 0) {
 		return nil, fmt.Errorf("config mixes the legacy [[targets]] format with [[machines]]/[[routes]]; use one or the other")
 	}
@@ -1424,6 +2163,25 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 	model, err := buildMachinesAndRoutes(machineEntries, routeEntries, clock, fromLegacy)
 	if err != nil {
 		return nil, err
+	}
+
+	// A cache block naming a route that does not exist is a typo that would
+	// otherwise silently cache nothing. TCP routes carry no HTTP semantics,
+	// so they cannot be cached either.
+	for _, cr := range config.CacheConfig.Routes {
+		found := false
+		for _, route := range model.routes {
+			if route.Name == cr.Route {
+				if route.IsTCP() {
+					return nil, fmt.Errorf("cache route %q is a TCP route; only HTTP routes can be cached", cr.Route)
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("cache references unknown route %q", cr.Route)
+		}
 	}
 
 	return &ProxyConfig{
@@ -1443,6 +2201,12 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 		Routes:                model.routes,
 		RoutesByHostname:      model.byHostname,
 		RoutesByListenPort:    model.byListenPort,
+		CacheEnabled:          cacheEnabled,
+		CacheRootPath:         cacheRootPath,
+		CacheTTL:              cacheTTL,
+		CacheMaxResponseSize:  cacheMaxResponseSize,
+		CacheWarmInterval:     cacheWarmInterval,
+		CacheRoutes:           cacheRoutes,
 	}, nil
 }
 
@@ -1776,6 +2540,10 @@ func (l *StdLogger) Error(msg string, args ...interface{}) {
 	log.Printf("[ERROR] "+msg, args...)
 }
 
+func (l *StdLogger) Debug(msg string, args ...interface{}) {
+	log.Printf("[DEBUG] "+msg, args...)
+}
+
 func logStartup(logger Logger, version string) {
 	logger.Info("Starting doormouse version `%s`", version)
 }
@@ -1838,8 +2606,13 @@ func main() {
 	wolSender := NewUDPWOLSender(logger)
 	sshExecutor := NewDefaultSSHExecutor(logger)
 
+	var cache *CacheStore
+	if config.CacheEnabled {
+		cache = NewCacheStore(config.CacheRootPath, config.CacheTTL, config.CacheMaxResponseSize, config.CacheRoutes, logger)
+	}
+
 	// Create proxy service
-	proxy := NewProxyService(config, healthChecker, wolSender, sshExecutor, logger, clock)
+	proxy := NewProxyService(config, healthChecker, wolSender, sshExecutor, logger, clock, cache)
 
 	// Start the service, shutting down cleanly on SIGINT/SIGTERM
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
