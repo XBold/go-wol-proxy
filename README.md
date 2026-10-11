@@ -110,8 +110,9 @@ Point `photos.example.com` at the doormouse host, then open
 1. A request arrives for a configured hostname or listen port.
 2. doormouse checks cached machine health. If the host is up, it forwards
    immediately.
-3. Otherwise it sends magic packets every 500ms and polls until the host answers
-   or `timeout` expires.
+3. Otherwise it owns a wake: a burst of magic packets, then a health check once
+   the machine has had time to boot, repeating until the host answers or the
+   wake timeout expires. The wake outlives the request that triggered it.
 4. It then waits for the *route* to be ready, which is a separate check.
 5. It forwards the request and streams the response back.
 6. When no route has seen traffic for `inactivity_threshold` and no connection is
@@ -246,6 +247,35 @@ Three forms are accepted: `tcp://host:port`, `http://...` and `https://...`.
 > [!NOTE]
 > Readiness is polled only while the machine is live. A machine that sleeps all
 > day therefore generates no per-route traffic.
+
+## Wake strategy
+
+Waking a machine is a race against a boot, not against a request. doormouse
+runs each wake as one background operation per machine:
+
+- A burst of `wol_burst_count` magic packets (default 3, 500ms apart) is sent,
+  then doormouse waits `startup_time` before the first health check - a machine
+  that was just woken cannot answer one yet.
+- After that, each cycle re-sends the burst and waits again. The wait halves
+  each cycle (30s, 15s, 7.5s, ... down to 500ms) so the boot is spotted quickly,
+  or stays fixed at `wake_health_check_interval` if you prefer predictable
+  polling.
+- The whole wake is bounded by `wake_timeout` (default: the global `timeout`),
+  independent of any client's deadline.
+- The wake is owned by the proxy, not by the request that triggered it: clients
+  that time out or disconnect stop waiting, but the wake keeps running, the
+  machine still gets confirmed, and later requests join the in-flight wake
+  instead of firing another burst.
+
+```toml
+startup_time = "30s"   # global quiet period before the first health check
+
+[[machines]]
+name = "nas"
+wol_burst_count = 3            # 1-10; some NICs and switches drop a lone packet
+#wake_timeout = "2m"           # per-machine boot budget (default: global timeout)
+#wake_health_check_interval = "2s"  # fixed poll while waking (default: adaptive halving)
+```
 
 ## Static response cache
 

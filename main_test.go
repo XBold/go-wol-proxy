@@ -113,6 +113,14 @@ func (c *ManualClock) BlockUntil(n int) {
 	c.mu.Unlock()
 }
 
+// registeredCount reports how many tickers+timers have ever been registered.
+// A joiner that parks on an in-flight wake must not add any.
+func (c *ManualClock) registeredCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.registered
+}
+
 // Advance moves the clock forward and fires all due tickers/timers.
 // Channel sends happen outside the lock to avoid deadlock with receivers that call BlockUntil.
 func (c *ManualClock) Advance(d time.Duration) {
@@ -422,6 +430,7 @@ func newTestProxy(t *testing.T, backendHandler http.Handler) *testProxy {
 	cfg := &ProxyConfig{
 		Port:                ":0",
 		Timeout:             5 * time.Second,
+		StartupTime:         1 * time.Second,
 		PollInterval:        1 * time.Second,
 		HealthCheckInterval: 30 * time.Second,
 		HealthCacheDuration: 10 * time.Second,
@@ -2730,7 +2739,7 @@ func TestWaitForWake_ContextCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // already cancelled
 
-	err := tp.svc.waitForWake(ctx, tp.machine)
+	err := tp.svc.waitForWake(ctx, tp.machine, 0)
 	if err == nil {
 		t.Fatal("expected error from cancelled context, got nil")
 	}
@@ -2742,21 +2751,20 @@ func TestWaitForWake_Success(t *testing.T) {
 
 	result := make(chan error, 1)
 	go func() {
-		result <- tp.svc.waitForWake(context.Background(), tp.machine)
+		result <- tp.svc.waitForWake(context.Background(), tp.machine, 0)
 	}()
 
-	// 2 tickers (wol + healthCheck) + 1 After (timeout) = 3
+	// The burst sends its first packet, then registers a 500ms timer before
+	// the next one. Step through the burst so the wait timer gets registered.
+	tp.clock.BlockUntil(2) // wake timeout + first burst interval
+	tp.clock.Advance(500 * time.Millisecond)
 	tp.clock.BlockUntil(3)
-
-	// Step 1: fire the wol ticker (500ms) and wait until the goroutine sends the packet.
-	// This avoids the race where the health ticker and wol ticker fire at the same Advance
-	// and select non-deterministically picks health before wol.
 	tp.clock.Advance(500 * time.Millisecond)
-	tp.wol.waitForCalls(t, 1, 5*time.Second)
+	tp.clock.BlockUntil(4) // startup-time wait timer
 
-	// Step 2: flip health and fire the health ticker (now at 1s total).
+	// The first health check lands after startup_time.
 	tp.health.setResult(true)
-	tp.clock.Advance(500 * time.Millisecond)
+	tp.clock.Advance(tp.svc.config.StartupTime)
 
 	select {
 	case err := <-result:
@@ -2767,8 +2775,9 @@ func TestWaitForWake_Success(t *testing.T) {
 		t.Fatal("test timed out waiting for waitForWake to return")
 	}
 
-	if tp.wol.callCount() == 0 {
-		t.Error("expected at least one WOL call")
+	// One initial packet is not enough: every cycle sends a burst.
+	if tp.wol.callCount() < 3 {
+		t.Errorf("expected a burst of at least 3 WOL calls, got %d", tp.wol.callCount())
 	}
 
 	tp.machine.mu.RLock()
@@ -2787,10 +2796,10 @@ func TestWaitForWake_Timeout(t *testing.T) {
 
 	result := make(chan error, 1)
 	go func() {
-		result <- tp.svc.waitForWake(context.Background(), tp.machine)
+		result <- tp.svc.waitForWake(context.Background(), tp.machine, 0)
 	}()
 
-	tp.clock.BlockUntil(3)
+	tp.clock.BlockUntil(2)
 	tp.clock.Advance(tp.svc.config.Timeout + time.Millisecond)
 
 	select {
@@ -2812,21 +2821,25 @@ func TestWaitForWake_WOLRetransmission(t *testing.T) {
 
 	result := make(chan error, 1)
 	go func() {
-		result <- tp.svc.waitForWake(context.Background(), tp.machine)
+		result <- tp.svc.waitForWake(context.Background(), tp.machine, 0)
 	}()
 
-	tp.clock.BlockUntil(3)
-
-	// Advance to fire wol ticker twice, synchronising on each via waitForCalls.
-	// wol ticker = 500ms; health returns false so the loop continues.
-	tp.clock.Advance(500 * time.Millisecond)
+	// First burst: 3 packets, 500ms apart.
+	tp.clock.BlockUntil(2)
 	tp.wol.waitForCalls(t, 1, 5*time.Second)
-
 	tp.clock.Advance(500 * time.Millisecond)
-	tp.wol.waitForCalls(t, 2, 5*time.Second)
+	tp.clock.BlockUntil(3)
+	tp.clock.Advance(500 * time.Millisecond)
+	tp.clock.BlockUntil(4)
+	tp.wol.waitForCalls(t, 3, 5*time.Second)
 
-	if tp.wol.callCount() < 2 {
-		t.Errorf("expected at least 2 WOL calls for retransmission, got %d", tp.wol.callCount())
+	// The first check fails (at startup_time); the next cycle re-sends the
+	// burst. The wait halves, so the second burst starts after StartupTime.
+	tp.clock.Advance(tp.svc.config.StartupTime)
+	tp.wol.waitForCalls(t, 4, 5*time.Second)
+
+	if tp.wol.callCount() < 4 {
+		t.Errorf("expected at least 4 WOL calls for retransmission, got %d", tp.wol.callCount())
 	}
 
 	// Let it timeout so the goroutine exits cleanly.
@@ -3278,7 +3291,7 @@ func TestHandleRequest_WakeTimeout(t *testing.T) {
 		result <- resp.StatusCode
 	}()
 
-	tp.clock.BlockUntil(3)
+	tp.clock.BlockUntil(2)
 	tp.clock.Advance(tp.svc.config.Timeout + time.Millisecond)
 
 	select {
@@ -3310,9 +3323,15 @@ func TestHandleRequest_WakeSuccess(t *testing.T) {
 		result <- resp.StatusCode
 	}()
 
+	// Step through the wake burst, then let the first health check land after
+	// startup_time.
+	tp.clock.BlockUntil(2)
+	tp.clock.Advance(500 * time.Millisecond)
 	tp.clock.BlockUntil(3)
+	tp.clock.Advance(500 * time.Millisecond)
+	tp.clock.BlockUntil(4)
 	tp.health.setResult(true)
-	tp.clock.Advance(tp.svc.config.PollInterval)
+	tp.clock.Advance(tp.svc.config.StartupTime)
 
 	select {
 	case code := <-result:
@@ -3346,8 +3365,12 @@ func TestHandleRequest_ExpiredCache_WakesSuccessfully(t *testing.T) {
 		result <- resp.StatusCode
 	}()
 
+	tp.clock.BlockUntil(2)
+	tp.clock.Advance(500 * time.Millisecond)
 	tp.clock.BlockUntil(3)
-	tp.clock.Advance(tp.svc.config.PollInterval)
+	tp.clock.Advance(500 * time.Millisecond)
+	tp.clock.BlockUntil(4)
+	tp.clock.Advance(tp.svc.config.StartupTime)
 
 	select {
 	case code := <-result:
@@ -3472,8 +3495,8 @@ func TestE2E_WakeOnDemandAndProxy(t *testing.T) {
 		result <- resp
 	}()
 
-	// Wait for waitForWake to register its tickers/timer before advancing time.
-	tp.clock.BlockUntil(3)
+	// Wait for the wake to register its timeout and first burst timer.
+	tp.clock.BlockUntil(2)
 
 	// WOL packet must be sent with the configured MAC and broadcast address.
 	tp.clock.Advance(500 * time.Millisecond)
@@ -3489,9 +3512,13 @@ func TestE2E_WakeOnDemandAndProxy(t *testing.T) {
 		t.Errorf("WOL broadcast IP = %q, want 255.255.255.255", call.ip)
 	}
 
-	// Simulate the target coming online; next health-check tick resolves the wait.
-	tp.health.setResult(true)
+	// Step through the rest of the burst, then simulate the target coming
+	// online; the first health check lands after startup_time.
+	tp.clock.BlockUntil(3)
 	tp.clock.Advance(500 * time.Millisecond)
+	tp.clock.BlockUntil(4)
+	tp.health.setResult(true)
+	tp.clock.Advance(tp.svc.config.StartupTime)
 
 	select {
 	case resp := <-result:
@@ -3614,17 +3641,46 @@ func TestWakeAndWait_ConcurrentRequests_JoinSingleWake(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go func() { tp.svc.wakeAndWait(ctx, tp.machine) }()
-	// 1 After (timeout) + 2 tickers (poll, wol) registered once waitForWake is entered.
-	tp.clock.BlockUntil(3)
+	first := make(chan error, 1)
+	go func() { first <- tp.svc.wakeAndWait(ctx, tp.machine) }()
+	// The initiator's wake registers the wake timeout and the first burst timer.
+	tp.clock.BlockUntil(2)
 
-	go func() { tp.svc.wakeAndWait(ctx, tp.machine) }()
-	// The joiner reaches waitForWake too, registering a second set of 3.
-	// Its SendWOL, if any, is recorded before those registrations.
-	tp.clock.BlockUntil(6)
+	second := make(chan error, 1)
+	go func() { second <- tp.svc.wakeAndWait(ctx, tp.machine) }()
+	// The wake cannot progress without the test advancing the clock, so a short
+	// real-time pause guarantees the joiner reached the in-flight wake before
+	// the test drives it to completion.
+	time.Sleep(100 * time.Millisecond)
 
 	if got := tp.wol.callCount(); got != 1 {
-		t.Errorf("expected the second request to join the in-progress wake (1 WOL packet), got %d", got)
+		t.Fatalf("expected the second request to join the in-progress wake (1 WOL packet), got %d", got)
+	}
+	if got := tp.clock.registeredCount(); got != 2 {
+		t.Errorf("expected the joiner to register no timers of its own, got %d", got)
+	}
+
+	// Complete the wake; both callers must return with the same outcome.
+	tp.health.setResult(true)
+	tp.clock.Advance(500 * time.Millisecond) // burst timer 1 -> packet #2
+	tp.clock.BlockUntil(3)
+	tp.clock.Advance(500 * time.Millisecond) // burst timer 2 -> packet #3 + wait timer
+	tp.clock.BlockUntil(4)
+	tp.clock.Advance(tp.svc.config.StartupTime) // first health check lands, machine is up
+
+	for i, ch := range []chan error{first, second} {
+		select {
+		case err := <-ch:
+			if err != nil {
+				t.Errorf("wake %d returned error: %v", i, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("wake %d never returned", i)
+		}
+	}
+
+	if got := tp.wol.callCount(); got != 3 {
+		t.Errorf("expected one burst of 3 WOL packets for the single wake, got %d", got)
 	}
 }
 
@@ -3635,23 +3691,303 @@ func TestWakeAndWait_FailedPollCycle_KeepsWakeHeld(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go func() { tp.svc.wakeAndWait(ctx, tp.machine) }()
-	tp.clock.BlockUntil(3)
+	first := make(chan error, 1)
+	go func() { first <- tp.svc.wakeAndWait(ctx, tp.machine) }()
+	tp.clock.BlockUntil(2)
 
-	// Drive a full poll cycle that finds the target still down. Both the WOL and
-	// poll tickers come due; waiting for both to be consumed guarantees the wake
-	// loop completed at least one iteration.
-	tp.clock.Advance(tp.svc.config.PollInterval)
-	waitFor(t, 5*time.Second, "the wake loop to consume both ticks", func() bool {
-		return tp.wol.callCount() >= 2 && tp.health.checks() >= 1
+	// Drive a full cycle: the burst completes and the first health check lands
+	// after startup_time, finding the machine still down. The wake then starts
+	// its second burst and parks on its first burst timer - a quiet point from
+	// which a joiner cannot be confused with wake progress.
+	tp.clock.Advance(500 * time.Millisecond)
+	tp.clock.BlockUntil(3)
+	tp.clock.Advance(500 * time.Millisecond)
+	tp.clock.BlockUntil(4)
+	tp.clock.Advance(tp.svc.config.StartupTime)
+	waitFor(t, 5*time.Second, "the wake to start its second burst", func() bool {
+		return tp.wol.callCount() >= 4 && tp.health.checks() >= 1 && tp.clock.registeredCount() == 5
 	})
 	before := tp.wol.callCount()
 
-	go func() { tp.svc.wakeAndWait(ctx, tp.machine) }()
-	tp.clock.BlockUntil(6)
+	second := make(chan error, 1)
+	go func() { second <- tp.svc.wakeAndWait(ctx, tp.machine) }()
+	time.Sleep(100 * time.Millisecond)
 
 	if got := tp.wol.callCount(); got != before {
 		t.Errorf("expected the later request to join the in-progress wake, got %d extra WOL packet(s)", got-before)
+	}
+	if got := tp.clock.registeredCount(); got != 5 {
+		t.Errorf("expected the joiner to register no timers of its own, got %d", got)
+	}
+}
+
+const wakeOptionsConfig = `
+port = "8080"
+timeout = "1m"
+poll_interval = "5s"
+health_check_interval = "30s"
+health_cache_duration = "10s"
+
+[[machines]]
+name = "llamacpp"
+mac_address = "A8:A1:59:40:D6:7D"
+broadcast_ip = "192.168.50.255"
+health_check = "http://192.168.50.2:8080/health"
+wake_timeout = "120s"
+wake_health_check_interval = "2s"
+wol_burst_count = 5
+
+[[machines]]
+name = "other"
+mac_address = "AA:BB:CC:DD:EE:FF"
+broadcast_ip = "10.0.0.255"
+health_check = "tcp://other.local:22"
+
+[[routes]]
+machine = "llamacpp"
+hostname = "llamacpp.home.com"
+destination = "http://192.168.50.2:8080"
+
+[[routes]]
+machine = "other"
+hostname = "other.home.com"
+destination = "http://other.local"
+`
+
+func TestLoadConfigWakeOptions(t *testing.T) {
+	cfg, err := LoadConfig(writeTempConfig(t, wakeOptionsConfig), RealClock{})
+	if err != nil {
+		t.Fatalf("config failed to load: %v", err)
+	}
+	if got := cfg.StartupTime; got != 30*time.Second {
+		t.Errorf("default StartupTime = %v, want 30s", got)
+	}
+
+	m := cfg.Machines["llamacpp"]
+	if m == nil {
+		t.Fatalf("expected machine 'llamacpp', got %v", cfg.Machines)
+	}
+	if got := m.Config.WakeTimeout; got != 120*time.Second {
+		t.Errorf("WakeTimeout = %v, want 120s", got)
+	}
+	if got := m.Config.WakeHealthCheckInterval; got != 2*time.Second {
+		t.Errorf("WakeHealthCheckInterval = %v, want 2s", got)
+	}
+	if got := m.Config.WolBurstCount; got != 5 {
+		t.Errorf("WolBurstCount = %d, want 5", got)
+	}
+
+	other := cfg.Machines["other"]
+	if other == nil {
+		t.Fatalf("expected machine 'other', got %v", cfg.Machines)
+	}
+	if got := other.Config.WakeTimeout; got != 0 {
+		t.Errorf("machine without wake_timeout: WakeTimeout = %v, want 0 (global default)", got)
+	}
+	if got := other.Config.WakeHealthCheckInterval; got != 0 {
+		t.Errorf("machine without wake_health_check_interval: WakeHealthCheckInterval = %v, want 0 (adaptive)", got)
+	}
+	if got := other.Config.WolBurstCount; got != 0 {
+		t.Errorf("machine without wol_burst_count: WolBurstCount = %d, want 0 (default burst)", got)
+	}
+}
+
+// startup_time must stay below the *effective* wake timeout: the global
+// timeout by default, a machine's wake_timeout when it sets one.
+func TestLoadConfigWakeValidation(t *testing.T) {
+	load := func(t *testing.T, globalExtra, machineExtra string) error {
+		t.Helper()
+		src := `
+port = "8080"
+timeout = "1m"
+poll_interval = "5s"
+health_check_interval = "30s"
+health_cache_duration = "10s"
+` + globalExtra + `
+[[machines]]
+name = "nas"
+mac_address = "AA:BB:CC:DD:EE:FF"
+broadcast_ip = "255.255.255.255"
+health_check = "tcp://nas.local:22"
+` + machineExtra + `
+[[routes]]
+machine = "nas"
+hostname = "nas.home.com"
+destination = "http://nas.local"
+`
+		_, err := LoadConfig(writeTempConfig(t, src), RealClock{})
+		return err
+	}
+
+	if err := load(t, `startup_time = "90s"`, ""); err == nil ||
+		!strings.Contains(err.Error(), "must be less than timeout") {
+		t.Errorf("startup_time above the global timeout must be rejected, got: %v", err)
+	}
+	if err := load(t, `startup_time = "90s"`, `wake_timeout = "30s"`); err == nil ||
+		!strings.Contains(err.Error(), "must be less than wake_timeout") {
+		t.Errorf("startup_time above a per-machine wake_timeout must be rejected, got: %v", err)
+	}
+	if err := load(t, `startup_time = "90s"`, `wake_timeout = "2m"`); err != nil {
+		t.Errorf("startup_time below the machine's own wake_timeout must be accepted, got: %v", err)
+	}
+	if err := load(t, "", `wake_timeout = "nope"`); err == nil ||
+		!strings.Contains(err.Error(), "invalid wake_timeout") {
+		t.Errorf("invalid wake_timeout must be rejected, got: %v", err)
+	}
+	if err := load(t, "", `wake_health_check_interval = "nope"`); err == nil ||
+		!strings.Contains(err.Error(), "invalid wake_health_check_interval") {
+		t.Errorf("invalid wake_health_check_interval must be rejected, got: %v", err)
+	}
+	if err := load(t, "", "wol_burst_count = 11"); err == nil ||
+		!strings.Contains(err.Error(), "wol_burst_count") {
+		t.Errorf("wol_burst_count above 10 must be rejected, got: %v", err)
+	}
+	if err := load(t, "", "wol_burst_count = 0"); err != nil {
+		t.Errorf("wol_burst_count = 0 means unset and must be accepted, got: %v", err)
+	}
+}
+
+func TestPerMachineWakeTimeoutHonoredAndRetryable(t *testing.T) {
+	tp := newTestProxy(t, nil)
+	tp.health.setResult(false)
+	tp.machine.Config.WakeTimeout = 2 * time.Second // shorter than the global 5s
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	first := make(chan error, 1)
+	go func() { first <- tp.svc.wakeAndWait(ctx, tp.machine) }()
+	tp.clock.BlockUntil(2)
+	tp.clock.Advance(500 * time.Millisecond)
+	tp.clock.BlockUntil(3)
+	tp.clock.Advance(500 * time.Millisecond)
+	tp.clock.BlockUntil(4) // wait timer for the first cycle
+	// The machine's 2s budget expires before its own wait timer does.
+	tp.clock.Advance(1*time.Second + time.Millisecond)
+
+	select {
+	case err := <-first:
+		if err == nil || !strings.Contains(err.Error(), "after 2s") {
+			t.Errorf("expected wake to time out at the machine's own 2s budget, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("wake never returned")
+	}
+
+	// The failed wake released the machine: a later request starts a fresh one
+	// instead of joining a dead generation.
+	second := make(chan error, 1)
+	go func() { second <- tp.svc.wakeAndWait(ctx, tp.machine) }()
+	tp.clock.BlockUntil(6) // new wake's timeout + first burst timer
+	before := tp.wol.callCount()
+	tp.clock.Advance(500 * time.Millisecond)
+	tp.wol.waitForCalls(t, before+1, 5*time.Second)
+
+	tp.clock.Advance(2*time.Second + time.Millisecond)
+	if err := <-second; err == nil {
+		t.Error("expected the second wake to time out as well")
+	}
+}
+
+func TestWakeSurvivesInitiatorDisconnect(t *testing.T) {
+	tp := newTestProxy(t, nil)
+	tp.health.setResult(false)
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	first := make(chan error, 1)
+	go func() { first <- tp.svc.wakeAndWait(ctx1, tp.machine) }()
+	tp.clock.BlockUntil(2)
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	second := make(chan error, 1)
+	go func() { second <- tp.svc.wakeAndWait(ctx2, tp.machine) }()
+	time.Sleep(100 * time.Millisecond) // the joiner parks on the in-flight wake
+
+	// The client that started the wake gives up. Only its wait ends; the wake
+	// itself keeps running.
+	cancel1()
+	select {
+	case err := <-first:
+		if err != context.Canceled {
+			t.Errorf("initiator got %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("initiator never returned after cancel")
+	}
+
+	// The machine comes up; the wake completes on its own schedule and the
+	// joiner sees the result.
+	tp.health.setResult(true)
+	tp.clock.Advance(500 * time.Millisecond)
+	tp.clock.BlockUntil(3)
+	tp.clock.Advance(500 * time.Millisecond)
+	tp.clock.BlockUntil(4)
+	tp.clock.Advance(tp.svc.config.StartupTime)
+
+	select {
+	case err := <-second:
+		if err != nil {
+			t.Errorf("joiner got %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("joiner never returned")
+	}
+
+	tp.machine.mu.RLock()
+	healthy := tp.machine.IsHealthy
+	tp.machine.mu.RUnlock()
+	if !healthy {
+		t.Error("expected machine marked healthy even though the initiator left")
+	}
+	if got := tp.wol.callCount(); got != 3 {
+		t.Errorf("expected one burst of 3 WOL packets, got %d", got)
+	}
+}
+
+func TestWakeFixedCheckInterval(t *testing.T) {
+	tp := newTestProxy(t, nil)
+	tp.health.setResult(false)
+	tp.machine.Config.WakeHealthCheckInterval = 1 * time.Second
+
+	result := make(chan error, 1)
+	go func() { result <- tp.svc.waitForWake(context.Background(), tp.machine, 0) }()
+
+	// Burst, then the first check lands after startup_time (t+2s) and fails.
+	tp.clock.BlockUntil(2)
+	tp.clock.Advance(500 * time.Millisecond)
+	tp.clock.BlockUntil(3)
+	tp.clock.Advance(500 * time.Millisecond)
+	tp.clock.BlockUntil(4)
+	tp.clock.Advance(tp.svc.config.StartupTime)
+	waitFor(t, 5*time.Second, "the first wake health check", func() bool {
+		return tp.health.checks() == 1
+	})
+
+	// Step the next burst (ends t+3s) plus 600ms. Adaptive halving of the 1s
+	// startup_time would already have polled at t+3.5s; the fixed 1s interval
+	// polls at t+4s, so at t+3.6s there must still be exactly one check.
+	// BlockUntil each registration before the advance that fires it, so the
+	// wait timer's deadline is anchored at t+3s, not at a later now.
+	tp.clock.Advance(500 * time.Millisecond)
+	tp.clock.BlockUntil(6)
+	tp.clock.Advance(500 * time.Millisecond)
+	tp.clock.BlockUntil(7)
+	tp.clock.Advance(600 * time.Millisecond)
+	if got := tp.health.checks(); got != 1 {
+		t.Fatalf("fixed 1s interval must not poll at t+3.5s, got %d checks", got)
+	}
+
+	// The fixed wait expires at t+4s, before the 5s wake timeout.
+	tp.clock.Advance(500 * time.Millisecond)
+	waitFor(t, 5*time.Second, "the second wake health check", func() bool {
+		return tp.health.checks() == 2
+	})
+
+	// Let it time out so the goroutine exits cleanly.
+	tp.clock.Advance(tp.svc.config.Timeout + time.Millisecond)
+	if err := <-result; err == nil {
+		t.Error("expected timeout error")
 	}
 }
 
