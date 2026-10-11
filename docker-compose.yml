@@ -1,0 +1,19 @@
+services:
+  go-wol-proxy:
+    image: ghcr.io/xbold/go-wol-proxy:latest
+    # Note: network_mode "host" is required for Wake-on-LAN packets to reach the network broadcast address.
+    # This exposes the container's ports directly on the host network.
+    network_mode: host
+    environment:
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      # TZ defaults to UTC if not set (e.g., export TZ=Europe/Paris)
+      - TZ=${TZ:-UTC}
+    restart: unless-stopped
+    volumes:
+      - ./config.toml:/app/config.toml
+      # Optional: Cache
+      - ./go-wol-proxy/cache:/app/cache
+      # Optional: SSH private key for graceful shutdown (uncomment if needed)
+      # - ./go-wol-proxy/private_key:/app/private_key
+    stop_grace_period: 30s
