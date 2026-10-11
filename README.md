@@ -247,6 +247,42 @@ Three forms are accepted: `tcp://host:port`, `http://...` and `https://...`.
 > Readiness is polled only while the machine is live. A machine that sleeps all
 > day therefore generates no per-route traffic.
 
+## Static response cache
+
+```toml
+[cache]
+enabled = true
+root_path = "./cache"
+ttl = "24h"
+max_response_size_bytes = 10485760
+warm_interval = "30m"
+
+[[cache.routes]]
+route = "files.home.com"
+paths = ["/docs", "/assets/*"]
+```
+
+Some routes serve content that does not need the machine to be awake: a model
+list, static assets, a landing page. With the cache enabled, a `GET` whose path
+matches a configured pattern is served straight from disk when the machine is
+offline, instead of waking it. The client gets a full answer while the box
+stays asleep.
+
+A `/*` suffix caches everything under a prefix (`/assets/*` covers
+`/assets/app.css`). Only `GET` requests with a 2xx status are cached, and only
+for routes named in `[[cache.routes]]`; responses larger than
+`max_response_size_bytes` are skipped.
+
+The cache keeps itself warm: whenever a machine wakes up, and every
+`warm_interval` while it stays up, the configured paths are re-fetched. A
+response whose body has not changed is not rewritten, so a static file list
+does not churn the disk. Entries older than `ttl` are dropped.
+
+> [!NOTE]
+> Cached responses are replayed with the upstream headers they were stored
+> with, minus framing headers. The proxy does not revalidate them against the
+> machine, so pick a `ttl` that matches how stale the content may get.
+
 ## Idle shutdown
 
 ```toml

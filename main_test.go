@@ -313,6 +313,8 @@ func (l *recordingLogger) Info(msg string, args ...interface{}) {
 
 func (l *recordingLogger) Error(msg string, args ...interface{}) { l.Info(msg, args...) }
 
+func (l *recordingLogger) Debug(msg string, args ...interface{}) { l.Info(msg, args...) }
+
 func (l *recordingLogger) all() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -323,6 +325,7 @@ type noopLogger struct{}
 
 func (noopLogger) Info(_ string, _ ...interface{})  {}
 func (noopLogger) Error(_ string, _ ...interface{}) {}
+func (noopLogger) Debug(_ string, _ ...interface{}) {}
 
 type startupLogger struct {
 	info  []string
@@ -336,6 +339,8 @@ func (l *startupLogger) Info(msg string, args ...interface{}) {
 func (l *startupLogger) Error(msg string, args ...interface{}) {
 	l.error = append(l.error, fmt.Sprintf(msg, args...))
 }
+
+func (l *startupLogger) Debug(msg string, args ...interface{}) {}
 
 func TestLogStartup_LogsDoormouseVersionAtInfoLevel(t *testing.T) {
 	logger := &startupLogger{}
@@ -425,7 +430,7 @@ func newTestProxy(t *testing.T, backendHandler http.Handler) *testProxy {
 		RoutesByHostname:    map[string]*Route{testHostname: route},
 	}
 
-	svc := NewProxyService(cfg, health, wol, ssh, noopLogger{}, clock)
+	svc := NewProxyService(cfg, health, wol, ssh, noopLogger{}, clock, nil)
 
 	return &testProxy{svc: svc, clock: clock, health: health, wol: wol, ssh: ssh, machine: machineState, route: route, backend: backend}
 }

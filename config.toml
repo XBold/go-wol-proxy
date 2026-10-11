@@ -19,6 +19,23 @@ poll_interval = "5s"            # How often to check health while waiting
 health_check_interval = "30s"   # Background health check frequency
 health_cache_duration = "10s"   # How long to trust a cached health result
 
+# Optional static response cache. When a machine is offline, GET responses
+# for the configured paths are served from disk instead of waking it: the
+# client gets a full answer while the box stays asleep. The cached paths are
+# refreshed again whenever the machine wakes up.
+[cache]
+enabled = false                            # Enable static response caching
+root_path = "./cache"                      # Directory to store cached responses
+ttl = "24h"                                # How long cached entries remain valid
+max_response_size_bytes = 10485760         # Maximum response size to cache (10MB)
+warm_interval = "30m"                      # How often to refresh cached paths while a machine is up
+
+# Which paths to cache, per route. A "/*" suffix caches everything under a
+# prefix (e.g. every file under /assets/).
+# [[cache.routes]]
+# route = "files.home.com"                 # Route name: its hostname
+# paths = ["/docs", "/assets/*"]
+
 # Optional SSL configuration. Do not add these values unless you plan to use TLS/HTTPS
 #ssl_certificate = "/path/to/cert.pem"
 #ssl_certificate_key = "/path/to/key.pem"
