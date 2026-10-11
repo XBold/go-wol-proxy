@@ -213,6 +213,15 @@ name that only exists while the host is up cannot be used to wake it. Give the
 machine a DHCP reservation and a static DNS entry, or write the IP straight into
 the config.
 
+### Names on the near side
+
+By default doormouse does a reverse-DNS (PTR) lookup for each client IP and logs
+the hostname alongside the address, so the request log shows which machine or
+service sent the traffic. The lookup is best-effort and cached (results for 30
+minutes, failures for 2), and it never delays a request. Set
+`client_hostname_lookup = false` to disable it, for example when the network has
+no PTR records or DNS lookups are slow.
+
 ## Liveness and readiness
 
 There are two `health_check` fields and they answer different questions.

@@ -21,6 +21,9 @@ server_idle_timeout = "120s"    # How long to wait for the next request when kee
 poll_interval = "5s"            # How often to check health while waiting
 health_check_interval = "30s"   # Background health check frequency
 health_cache_duration = "10s"   # How long to trust a cached health result
+client_hostname_lookup = true   # Reverse-DNS (PTR) lookup of client IPs for the request log;
+                                # results are cached, lookups never block the request. Set to false
+                                # to disable (e.g. when DNS lookups are slow or you are behind NAT)
 
 # Optional static response cache. When a machine is offline, GET responses
 # for the configured paths are served from disk instead of waking it: the
