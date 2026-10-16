@@ -110,9 +110,10 @@ Point `photos.example.com` at the doormouse host, then open
 1. A request arrives for a configured hostname or listen port.
 2. doormouse checks cached machine health. If the host is up, it forwards
    immediately.
-3. Otherwise it owns a wake: a burst of magic packets, then a health check once
-   the machine has had time to boot, repeating until the host answers or the
-   wake timeout expires. The wake outlives the request that triggered it.
+3. Otherwise it owns a wake: one health check first (a stale cache is not proof
+   it is down), then a burst of magic packets, then a health check once the
+   machine has had time to boot, repeating until the host answers or the wake
+   timeout expires. The wake outlives the request that triggered it.
 4. It then waits for the *route* to be ready, which is a separate check.
 5. It forwards the request and streams the response back.
 6. When no route has seen traffic for `inactivity_threshold` and no connection is
@@ -253,9 +254,12 @@ Three forms are accepted: `tcp://host:port`, `http://...` and `https://...`.
 Waking a machine is a race against a boot, not against a request. doormouse
 runs each wake as one background operation per machine:
 
-- A burst of `wol_burst_count` magic packets (default 3, 500ms apart) is sent,
-  then doormouse waits `startup_time` before the first health check - a machine
-  that was just woken cannot answer one yet.
+- Before a single packet is sent, doormouse checks health once. A health entry
+  that has simply gone stale is not proof the machine is down, and an awake
+  machine is confirmed without any magic packets or startup wait.
+- If that check fails, a burst of `wol_burst_count` magic packets (default 3,
+  500ms apart) is sent, then doormouse waits `startup_time` before the next
+  health check - a machine that was just woken cannot answer one yet.
 - After that, each cycle re-sends the burst and waits again. The wait halves
   each cycle (30s, 15s, 7.5s, ... down to 500ms) so the boot is spotted quickly,
   or stays fixed at `wake_health_check_interval` if you prefer predictable
@@ -269,6 +273,13 @@ runs each wake as one background operation per machine:
 
 ```toml
 startup_time = "30s"   # global quiet period before the first health check
+                       # Must be strictly less than each machine's effective wake
+                       # budget: its wake_timeout when set, otherwise the global
+                       # timeout. Setting it equal to that budget is rejected as a
+                       # configuration error - the quiet period would eat the whole
+                       # budget and the wake would time out before checking once.
+                       # Omit it and the default is derived from the tightest wake
+                       # budget in the config instead of a fixed 30s.
 
 [[machines]]
 name = "nas"

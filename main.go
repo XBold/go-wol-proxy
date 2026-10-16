@@ -1099,13 +1099,13 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, machine *Machine) error 
 	return p.joinWake(ctx, machine, info)
 }
 
-// runWake performs the actual wake (WOL bursts + health polling) for one
-// generation, fully detached from any request context. Clients routinely time
-// out long before a machine can boot, so the wake must outlive them: it runs
-// on a fresh background context bounded only by the (per-machine) wake
-// timeout, and it always reaches finishWake, which releases every waiter and
-// clears IsWaking. The first burst packet goes out immediately; waitForWake
-// owns all packet sending.
+// runWake performs the actual wake (health check first, then WOL bursts and
+// health polling) for one generation, fully detached from any request context.
+// Clients routinely time out long before a machine can boot, so the wake must
+// outlive them: it runs on a fresh background context bounded only by the
+// (per-machine) wake timeout, and it always reaches finishWake, which releases
+// every waiter and clears IsWaking. waitForWake owns all packet sending, and
+// sends none at all if the machine turns out to be up already.
 func (p *ProxyService) runWake(machine *Machine, info *wakeInfo) {
 	p.logger.Info("WOL wake started for %s (gen=%d)", machine.Name, info.gen)
 
@@ -1157,14 +1157,16 @@ func (p *ProxyService) joinWake(ctx context.Context, machine *Machine, info *wak
 	}
 }
 
-// waitForWake repeatedly sends a burst of WOL packets and waits for the
-// machine to come up. Each cycle is strictly: send a burst of burstCount
-// packets 500ms apart, THEN wait the full waitDuration, and only THEN perform
-// a single health check. Checking health immediately after a burst is
-// pointless - the machine hasn't had time to boot - so no check happens until
-// the full wait has elapsed.
+// waitForWake brings the machine up. It first runs one health check before any
+// packet is sent: a stale health cache does not mean the machine is down, and a
+// machine that is already up should not pay for a burst and a startup quiet
+// period. Only if that check fails does the polling loop start, and each cycle
+// there is strictly: send a burst of burstCount packets 500ms apart, THEN wait
+// the full waitDuration, and only THEN perform a single health check. Checking
+// health immediately after a burst is pointless - the machine hasn't had time
+// to boot - so no check happens until the full wait has elapsed.
 //
-// The first wait starts at startup_time (a machine that just got its WOL
+// The first loop wait starts at startup_time (a machine that just got its WOL
 // packet cannot answer a health check yet). The interval between subsequent
 // checks is either:
 //   - adaptive (default): halved on every retry, floored at 500ms
@@ -1197,6 +1199,23 @@ func (p *ProxyService) waitForWake(ctx context.Context, machine *Machine, wakeGe
 		}
 	}
 	burstInterval := 500 * time.Millisecond
+
+	// One check before anything is sent. The health cache goes stale on
+	// purpose (health_cache_duration is shorter than health_check_interval), so
+	// "no fresh proof it is up" is not "it is down". Without this, a request
+	// for an awake machine whose entry aged out fires a burst it does not need
+	// and then waits startup_time before looking - about 31s with the defaults,
+	// which is longer than most clients are willing to wait.
+	if p.healthChecker.Check(ctx, machine.Config.HealthCheck, "wake") {
+		machine.mu.Lock()
+		machine.IsHealthy = true
+		machine.LastCheck = p.clock.Now()
+		machine.mu.Unlock()
+
+		p.logger.Info("Machine %s answers a health check before any WOL was sent, no wake needed (gen=%d)",
+			machine.Name, wakeGen)
+		return nil
+	}
 
 	// sendWOLBurst sends burstCount WOL packets burstInterval apart. It
 	// returns early (with the cancellation cause) if the context is
@@ -1500,8 +1519,14 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 	// answer one yet. It must fit inside each machine's wake budget (its
 	// wake_timeout, or the global timeout), or the wake times out before it
 	// ever checks.
+	//
+	// Whether it was written down matters: an explicit value is held to that
+	// rule strictly, while an omitted one is derived from the budgets the
+	// config actually uses, so a config with a short timeout that never asked
+	// for a 30s quiet period still loads.
 	startupTime := 30 * time.Second
-	if config.StartupTime != "" {
+	startupTimeExplicit := config.StartupTime != ""
+	if startupTimeExplicit {
 		startupTime, err = time.ParseDuration(config.StartupTime)
 		if err != nil {
 			return nil, fmt.Errorf("invalid startup_time: %w", err)
@@ -1578,8 +1603,25 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 		return nil, err
 	}
 
+	// An omitted startup_time must not reject a config that never asked for a
+	// quiet period: take the tightest effective wake budget in use and give it
+	// half of that, which is always strictly inside the budget.
+	if !startupTimeExplicit {
+		for _, m := range model.machines {
+			budget := timeout
+			if m.Config.WakeTimeout > 0 {
+				budget = m.Config.WakeTimeout
+			}
+			if half := budget / 2; half < startupTime {
+				startupTime = half
+			}
+		}
+	}
+
 	// startup_time must fit inside each machine's effective wake budget: its
-	// own wake_timeout when set, the global timeout otherwise.
+	// own wake_timeout when set, the global timeout otherwise. Equality is
+	// rejected too - the quiet period would eat the whole budget and the wake
+	// would time out before the first check ever ran.
 	for _, m := range model.machines {
 		if m.Config.WakeTimeout > 0 {
 			if startupTime >= m.Config.WakeTimeout {
@@ -1796,6 +1838,10 @@ func validateDestination(name, destination string, isTCP bool) error {
 	return nil
 }
 
+// buildMachinesAndRoutes turns the flat [[machines]] and [[routes]] entries
+// into the live routing model: it validates each entry, derives a route's
+// health check from its destination when none is given, and rejects duplicate
+// hostnames, duplicate listen ports, unknown machines and malformed routes.
 func buildMachinesAndRoutes(machineEntries []MachineEntry, routeEntries []RouteEntry, clock Clock, fromLegacy bool) (routing, error) {
 	machines := make(map[string]*Machine)
 	routes := make([]*Route, 0, len(routeEntries))

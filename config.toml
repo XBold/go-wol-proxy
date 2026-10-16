@@ -2,8 +2,10 @@ port = ":8080"                  # Port to listen on for HTTP routes
 timeout = "1m"                  # How long to wait for a machine to wake / a route to become ready. 
                                 # Cannot be disabled with "0" or a negative value - it would time out immediately.
 startup_time = "30s"            # Quiet period after the first WOL packet before the first health check.
-                                # A machine that was just woken cannot answer a check yet. Must be less
-                                # than the effective wake timeout (global timeout, or a machine's wake_timeout).
+                                # A machine that was just woken cannot answer a check yet. Must be strictly
+                                # less than the effective wake timeout (global timeout, or a machine's
+                                # wake_timeout) - equal to it is a configuration error. Omit this key and
+                                # the default is derived from the tightest wake budget in the config.
 request_header_timeout = "30s"  # How long to wait for request headers; 
                                 # Use a negative value (e.g. "-1s") to disable it outright.
                                 # "0" alone falls back to server_read_timeout - 
