@@ -271,12 +271,27 @@ stays asleep.
 A `/*` suffix caches everything under a prefix (`/assets/*` covers
 `/assets/app.css`). Only `GET` requests with a 2xx status are cached, and only
 for routes named in `[[cache.routes]]`; responses larger than
-`max_response_size_bytes` are skipped.
+`max_response_size_bytes` are skipped. The query string is part of the identity
+of an entry, so `/models?filter=a` is stored and replayed separately from
+`/models`.
+
+Nothing that belongs to one client is ever stored: a request carrying an
+`Authorization` or `Cookie` header is not cached, and neither is a response that
+sets a `Set-Cookie` or declares `Cache-Control: private`, `no-store` or
+`no-cache`. A `Set-Cookie` header is also dropped from anything that does get
+stored, so a cached page cannot hand one visitor's session to the next.
+
+The cache answers only for a machine the health checker has confirmed down. A
+machine that is up but whose health entry has gone stale still serves its own
+response.
 
 The cache keeps itself warm: whenever a machine wakes up, and every
 `warm_interval` while it stays up, the configured paths are re-fetched. A
 response whose body has not changed is not rewritten, so a static file list
-does not churn the disk. Entries older than `ttl` are dropped.
+does not churn the disk. Entries older than `ttl` are dropped. Both `ttl` and
+`warm_interval` must be positive - a zero or negative value is rejected as a
+configuration error rather than expiring every entry or crashing the proxy at
+startup.
 
 > [!NOTE]
 > Cached responses are replayed with the upstream headers they were stored

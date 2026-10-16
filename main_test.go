@@ -313,8 +313,10 @@ func (l *recordingLogger) Info(msg string, args ...interface{}) {
 
 func (l *recordingLogger) Error(msg string, args ...interface{}) { l.Info(msg, args...) }
 
+// Debug records the debug line alongside the rest, so a test can assert on it.
 func (l *recordingLogger) Debug(msg string, args ...interface{}) { l.Info(msg, args...) }
 
+// all returns everything the logger has seen, newest last.
 func (l *recordingLogger) all() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -323,8 +325,13 @@ func (l *recordingLogger) all() string {
 
 type noopLogger struct{}
 
-func (noopLogger) Info(_ string, _ ...interface{})  {}
+// Info discards the message: most tests do not care about logging.
+func (noopLogger) Info(_ string, _ ...interface{}) {}
+
+// Error discards the message.
 func (noopLogger) Error(_ string, _ ...interface{}) {}
+
+// Debug discards the message.
 func (noopLogger) Debug(_ string, _ ...interface{}) {}
 
 type startupLogger struct {
@@ -340,8 +347,11 @@ func (l *startupLogger) Error(msg string, args ...interface{}) {
 	l.error = append(l.error, fmt.Sprintf(msg, args...))
 }
 
+// Debug ignores debug lines: this logger only captures what startup logged.
 func (l *startupLogger) Debug(msg string, args ...interface{}) {}
 
+// TestLogStartup_LogsDoormouseVersionAtInfoLevel checks that the running build
+// is announced at info level on startup.
 func TestLogStartup_LogsDoormouseVersionAtInfoLevel(t *testing.T) {
 	logger := &startupLogger{}
 

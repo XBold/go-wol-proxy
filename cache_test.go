@@ -100,6 +100,8 @@ func setupCacheProxy(t *testing.T, backend *httptest.Server, cacheDir string, pa
 	return p, cs, wol, hc, logger, machine
 }
 
+// setMachineHealth records a health result on the machine under its lock, the
+// way the health checker would.
 func setMachineHealth(machine *Machine, healthy bool) {
 	machine.mu.Lock()
 	machine.IsHealthy = healthy
@@ -107,6 +109,8 @@ func setMachineHealth(machine *Machine, healthy bool) {
 	machine.mu.Unlock()
 }
 
+// listCacheFiles names the entry files the cache has written for the test
+// route, so a test can assert nothing was stored rather than merely unreadable.
 func listCacheFiles(t *testing.T, dir string) []string {
 	t.Helper()
 	var out []string
@@ -184,6 +188,8 @@ destination = "http://192.168.50.2:8080"
 	}
 }
 
+// TestLoadConfigCacheDefaults checks that an enabled cache with only
+// enabled=true and a route entry gets the documented defaults.
 func TestLoadConfigCacheDefaults(t *testing.T) {
 	const toml = `
 port = ":9100"
@@ -232,6 +238,9 @@ destination = "http://nas.local"
 	}
 }
 
+// TestLoadConfigCacheRejectsUnknownRoute checks that a cache entry naming a
+// route the config does not define is a configuration error rather than a
+// silently dead cache.
 func TestLoadConfigCacheRejectsUnknownRoute(t *testing.T) {
 	const toml = `
 port = ":9100"
@@ -269,6 +278,8 @@ destination = "http://nas.local"
 	}
 }
 
+// TestLoadConfigCacheRejectsTCPRoute checks that a cache entry for a TCP route
+// is rejected: the cache stores HTTP responses and cannot answer a raw socket.
 func TestLoadConfigCacheRejectsTCPRoute(t *testing.T) {
 	const toml = `
 port = ":9100"

@@ -26,9 +26,9 @@ health_cache_duration = "10s"   # How long to trust a cached health result
 [cache]
 enabled = false                            # Enable static response caching
 root_path = "./cache"                      # Directory to store cached responses
-ttl = "24h"                                # How long cached entries remain valid
+ttl = "24h"                                # How long cached entries remain valid. Must be positive.
 max_response_size_bytes = 10485760         # Maximum response size to cache (10MB)
-warm_interval = "30m"                      # How often to refresh cached paths while a machine is up
+warm_interval = "30m"                      # How often to refresh cached paths while a machine is up. Must be positive.
 
 # Which paths to cache, per route. A "/*" suffix caches everything under a
 # prefix (e.g. every file under /assets/).

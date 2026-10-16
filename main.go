@@ -330,6 +330,9 @@ type CacheStore struct {
 	lastHashes  map[string][]byte // cache key -> last SHA-256 hash of body
 }
 
+// NewCacheStore returns a cache rooted at rootPath, holding entries for ttl,
+// rejecting bodies over maxSize, and covering the per-route path patterns in
+// routePaths. It creates the root and loads whatever is already on disk.
 func NewCacheStore(rootPath string, ttl time.Duration, maxSize int64, routePaths map[string][]string, logger Logger) *CacheStore {
 	cs := &CacheStore{
 		rootPath:    rootPath,
@@ -354,15 +357,20 @@ func NewCacheStore(rootPath string, ttl time.Duration, maxSize int64, routePaths
 	return cs
 }
 
+// key is the cache key for a route+path pair: a hash, so a URL path of any
+// shape (including a query string) maps to one safe file name.
 func (cs *CacheStore) key(routeName, urlPath string) string {
 	hash := sha256.Sum256([]byte(routeName + urlPath))
 	return fmt.Sprintf("%x", hash[:16])
 }
 
+// cacheFilePath is the on-disk envelope for a route+path pair.
 func (cs *CacheStore) cacheFilePath(routeName, urlPath string) string {
 	return filepath.Join(cs.rootPath, routeName, cs.key(routeName, urlPath)+".cache")
 }
 
+// load reads one entry from disk, reporting whether it exists and has not
+// passed its TTL.
 func (cs *CacheStore) load(routeName, urlPath string) (*cacheEntry, bool) {
 	// urlPath is a URL path: always slash-separated, so clean it with
 	// path.Clean rather than filepath.Clean, which would rewrite separators
@@ -415,6 +423,9 @@ func (cs *CacheStore) load(routeName, urlPath string) (*cacheEntry, bool) {
 	return &entry, true
 }
 
+// Save stores one response for a route+path pair, skipping the write when the
+// body is byte-identical to what is already on disk and rejecting bodies over
+// the configured size.
 func (cs *CacheStore) Save(routeName, urlPath string, statusCode int, headers http.Header, body []byte) {
 	urlPath = path.Clean(urlPath)
 	if urlPath == "." || urlPath == "" {
@@ -514,6 +525,14 @@ var hopByHopHeaders = []string{
 	"Content-Length",
 }
 
+// privateCachedHeaders are response headers that belong to the client that
+// fetched them. Replaying one to a different client leaks that client's session,
+// so they are dropped on save as well as screened on capture.
+var privateCachedHeaders = []string{"Set-Cookie"}
+
+// sanitizeCachedHeaders strips the framing/hop-by-hop headers that must not
+// travel with a stored response, and the per-client headers that must not be
+// replayed to anyone else.
 func sanitizeCachedHeaders(headers http.Header) http.Header {
 	sanitized := make(http.Header, len(headers))
 	for key, values := range headers {
@@ -524,12 +543,61 @@ func sanitizeCachedHeaders(headers http.Header) http.Header {
 				break
 			}
 		}
+		if !skip {
+			for _, private := range privateCachedHeaders {
+				if strings.EqualFold(key, private) {
+					skip = true
+					break
+				}
+			}
+		}
 		if skip {
 			continue
 		}
 		sanitized[key] = values
 	}
 	return sanitized
+}
+
+// requestHasUserState reports a request made with credentials, whose response
+// is that client's alone: caching it would serve one client's session content
+// to every other client that asks for the same path while the machine is down.
+func requestHasUserState(r *http.Request) bool {
+	return r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != ""
+}
+
+// responseHasUserState reports a response that is private to the client that
+// fetched it, either because it sets a cookie or because its Cache-Control
+// forbids shared caching.
+func responseHasUserState(h http.Header) bool {
+	if len(h.Values("Set-Cookie")) > 0 {
+		return true
+	}
+	cc := strings.ToLower(h.Get("Cache-Control"))
+	return strings.Contains(cc, "private") ||
+		strings.Contains(cc, "no-store") ||
+		strings.Contains(cc, "no-cache")
+}
+
+// cacheKeyFor is the cache identity of a request: its path plus its query
+// string. /models?filter=x and /models are different responses, so keying on
+// the path alone would let whichever was fetched last answer both. A request
+// with no query keys on the bare path, which is what the warm-up path stores
+// for the configured paths it re-fetches.
+func cacheKeyFor(r *http.Request) string {
+	if r.URL.RawQuery == "" {
+		return r.URL.Path
+	}
+	return r.URL.Path + "?" + r.URL.RawQuery
+}
+
+// splitCacheKey turns a cache key back into the path and query string needed
+// to re-fetch it while warming.
+func splitCacheKey(key string) (urlPath, rawQuery string) {
+	if i := strings.Index(key, "?"); i >= 0 {
+		return key[:i], key[i+1:]
+	}
+	return key, ""
 }
 
 // parseCacheEnvelope splits a single-file cache entry
@@ -557,10 +625,24 @@ func parseCacheEnvelope(data []byte) (meta cacheEntry, body []byte, ok bool) {
 }
 
 // writeFileAtomic writes data to a temp file in the same directory and renames
-// it into place, so readers never see a partially written file.
+// it into place, so readers never see a partially written file. The temp name is
+// unique per write: the wake-triggered warm-up, the periodic warm-up and a
+// proxied GET can all save the same key at the same time, and a shared temp path
+// would let them interleave into a corrupt envelope before the rename.
 func writeFileAtomic(filePath string, data []byte) error {
-	tmpFile := filePath + ".tmp"
-	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(filePath), filepath.Base(filePath)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpFile := tmp.Name()
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpFile)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpFile)
 		return err
 	}
 	if err := os.Rename(tmpFile, filePath); err != nil {
@@ -570,6 +652,8 @@ func writeFileAtomic(filePath string, data []byte) error {
 	return nil
 }
 
+// Get returns a stored response as it was saved, or false when there is no
+// fresh entry for that route+path pair.
 func (cs *CacheStore) Get(routeName, urlPath string) (*http.Response, bool) {
 	entry, ok := cs.load(routeName, urlPath)
 	if !ok {
@@ -589,6 +673,8 @@ func (cs *CacheStore) Get(routeName, urlPath string) (*http.Response, bool) {
 	return resp, true
 }
 
+// GetCachedPathsForRoute lists the paths worth re-fetching for a route: the
+// configured exact paths, plus the cached paths matching a /* pattern.
 func (cs *CacheStore) GetCachedPathsForRoute(routeName string) []string {
 	cs.entriesMu.RLock()
 	defer cs.entriesMu.RUnlock()
@@ -617,6 +703,8 @@ func (cs *CacheStore) GetCachedPathsForRoute(routeName string) []string {
 	return result
 }
 
+// addToAccessOrder records a key as most recently used and drops the oldest
+// ones once the LRU window overflows.
 func (cs *CacheStore) addToAccessOrder(key string) {
 	for i, k := range cs.accessOrder {
 		if k == key {
@@ -634,6 +722,9 @@ func (cs *CacheStore) addToAccessOrder(key string) {
 	}
 }
 
+// loadAll reads the existing cache entries for the configured routes back into
+// memory at startup, accepting both the current single-file envelope and the
+// older two-file layout.
 func (cs *CacheStore) loadAll() {
 	routes := make(map[string]bool)
 	for routeName := range cs.routePaths {
@@ -701,6 +792,8 @@ func (cs *CacheStore) loadAll() {
 	cs.logger.Info("Loaded %d cache entries", len(cs.entries))
 }
 
+// Cleanup drops in-memory entries that have outlived the TTL and removes their
+// files, so the cache directory cannot grow without bound.
 func (cs *CacheStore) Cleanup() {
 	cs.entriesMu.Lock()
 	defer cs.entriesMu.Unlock()
@@ -735,6 +828,7 @@ func (cs *CacheStore) Cleanup() {
 	}
 }
 
+// Close flushes what the cache still holds and clears expired entries.
 func (cs *CacheStore) Close() {
 	cs.Cleanup()
 }
@@ -742,21 +836,52 @@ func (cs *CacheStore) Close() {
 // catchingBody tees the proxied response body into a buffer and hands the
 // complete copy to onDone when the body is closed, so the cache is written
 // without buffering the whole response in front of the client.
+//
+// It only hands the copy over when the body ran to EOF without going past limit.
+// ReverseProxy closes the upstream body after a copy error too - a client that
+// hung up, an upstream reset - and saving that partial body would later serve a
+// truncated asset as a full 200. Buffering stops at limit for the same reason
+// the check exists: a multi-GB download under a /* pattern must not be held in
+// memory on the way to being rejected.
 type catchingBody struct {
-	io.Reader
 	original io.ReadCloser
-	onDone   func()
+	buf      *bytes.Buffer
+	limit    int64
+	overflow bool
+	eof      bool
+	onDone   func(body []byte)
 	closed   bool
 }
 
+// Read streams the body to the client and copies it into the buffer until the
+// size limit is passed, at which point the response is no longer worth caching
+// and the buffer is dropped.
+func (cb *catchingBody) Read(p []byte) (int, error) {
+	n, err := cb.original.Read(p)
+	if n > 0 && !cb.overflow {
+		if int64(cb.buf.Len()+n) > cb.limit {
+			cb.overflow = true
+			cb.buf = nil
+		} else {
+			cb.buf.Write(p[:n])
+		}
+	}
+	if err == io.EOF {
+		cb.eof = true
+	}
+	return n, err
+}
+
+// Close hands the buffered body to onDone only if it was complete and within
+// the limit, then closes the upstream body.
 func (cb *catchingBody) Close() error {
 	if cb.closed {
 		return nil
 	}
 	cb.closed = true
 
-	if cb.onDone != nil {
-		cb.onDone()
+	if cb.eof && !cb.overflow && cb.onDone != nil {
+		cb.onDone(cb.buf.Bytes())
 	}
 	if cb.original != nil {
 		return cb.original.Close()
@@ -1096,6 +1221,9 @@ type ProxyService struct {
 	cache         *CacheStore
 }
 
+// NewProxyService wires the configuration to the health checker, WOL sender,
+// SSH executor and (when enabled) the static response cache, and returns the
+// service that serves the configured routes.
 func NewProxyService(
 	config *ProxyConfig,
 	healthChecker HealthChecker,
@@ -1270,7 +1398,7 @@ func (p *ProxyService) warmMachine(machine *Machine) {
 			continue
 		}
 
-		for _, path := range cachedPaths {
+		for _, cacheKey := range cachedPaths {
 			select {
 			case <-ctx.Done():
 				p.logger.Debug("Cache warmup cancelled for machine: %s", machine.Name)
@@ -1278,28 +1406,43 @@ func (p *ProxyService) warmMachine(machine *Machine) {
 			case <-time.After(100 * time.Millisecond):
 			}
 
+			// A stored key carries the query string it was fetched with, so the
+			// refresh asks for the same URL, not the path alone.
+			urlPath, rawQuery := splitCacheKey(cacheKey)
 			reqURL := *routeURL
-			reqURL.Path = path
+			reqURL.Path = urlPath
+			reqURL.RawQuery = rawQuery
 
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL.String(), nil)
 			if err != nil {
-				p.logger.Error("Failed to create request for %s %s: %v", machine.Name, path, err)
+				p.logger.Error("Failed to create request for %s %s: %v", machine.Name, cacheKey, err)
 				continue
 			}
 
 			resp, err := client.Do(req)
 			if err != nil {
-				p.logger.Error("Failed to warm cache for %s %s: %v", machine.Name, path, err)
+				p.logger.Error("Failed to warm cache for %s %s: %v", machine.Name, cacheKey, err)
 				continue
 			}
 
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				body, err := io.ReadAll(io.LimitReader(resp.Body, p.config.CacheMaxResponseSize))
+				// One byte past the limit, so an oversized body is *detected*
+				// rather than silently truncated: LimitReader stops without an
+				// error, and a cut-off body saved as a 200 would be served to
+				// every later offline request as if it were the whole asset.
+				body, err := io.ReadAll(io.LimitReader(resp.Body, p.config.CacheMaxResponseSize+1))
 				resp.Body.Close()
 
-				if err == nil {
-					p.cache.Save(route.Name, path, resp.StatusCode, resp.Header, body)
+				if err != nil {
+					p.logger.Error("Failed to read %s %s while warming the cache: %v", machine.Name, cacheKey, err)
+					continue
 				}
+				if int64(len(body)) > p.config.CacheMaxResponseSize {
+					p.logger.Error("Skipping cache for %s %s: response is larger than %d bytes",
+						machine.Name, cacheKey, p.config.CacheMaxResponseSize)
+					continue
+				}
+				p.cache.Save(route.Name, cacheKey, resp.StatusCode, resp.Header, body)
 			} else {
 				resp.Body.Close()
 			}
@@ -1309,6 +1452,7 @@ func (p *ProxyService) warmMachine(machine *Machine) {
 	p.logger.Debug("Cache warmup completed for machine: %s", machine.Name)
 }
 
+// startCacheCleanup periodically drops expired cache entries.
 func (p *ProxyService) startCacheCleanup(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
@@ -1323,6 +1467,8 @@ func (p *ProxyService) startCacheCleanup(ctx context.Context) {
 	}
 }
 
+// startCacheWarming re-fetches the cached paths of every route whose machine
+// is up, so the cache still holds usable content the next time it sleeps.
 func (p *ProxyService) startCacheWarming(ctx context.Context) {
 	ticker := time.NewTicker(p.config.CacheWarmInterval)
 	defer ticker.Stop()
@@ -1354,10 +1500,14 @@ func (p *ProxyService) startCacheWarming(ctx context.Context) {
 	}
 }
 
+// isSecureServer reports a config that should serve TLS rather than plain HTTP.
 func isSecureServer(config *ProxyConfig) bool {
 	return config.SSLCertificate != "" && config.SSLCertificateKey != ""
 }
 
+// Start brings the service up: background health checks, the HTTP/TCP route
+// listeners, cache maintenance and the idle-shutdown sweep. It returns when ctx
+// is cancelled and the listeners have drained.
 func (p *ProxyService) Start(ctx context.Context) error {
 	// Start background health checks
 	p.healthChecker.StartBackgroundChecks(
@@ -1523,6 +1673,9 @@ func clientAddr(r *http.Request) string {
 	return r.RemoteAddr
 }
 
+// handleRequest serves one request on one route: resolve the route, log where
+// the request came from, answer from the static cache if the machine is
+// confirmed down and has a usable entry, and otherwise wake the machine first.
 func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 	route := p.routeForRequest(r)
 
@@ -1549,10 +1702,14 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 	// The machine looks down: before waking it, see whether the static cache
 	// can answer. A cached response means the client gets a full answer
 	// while the machine stays asleep.
-	if p.cache != nil && r.Method == http.MethodGet {
-		if resp, ok := p.cache.Get(route.Name, r.URL.Path); ok {
+	//
+	// Only a machine confirmed unhealthy may be answered from cache. The
+	// health cache going stale is not evidence the machine is down, and a live
+	// machine must serve its own response rather than a stored one.
+	if p.cache != nil && r.Method == http.MethodGet && machineConfirmedDown(machineState) {
+		if resp, ok := p.cache.Get(route.Name, cacheKeyFor(r)); ok {
 			p.logger.Info("Serving cached response for %s %s (machine %s is down)",
-				r.Method, r.URL.Path, machineName)
+				r.Method, r.URL.RequestURI(), machineName)
 			for k, v := range resp.Header {
 				for _, header := range v {
 					w.Header().Add(k, header)
@@ -1667,6 +1824,18 @@ func (p *ProxyService) routeForRequest(r *http.Request) *Route {
 	return p.config.RoutesByHostname[host]
 }
 
+// machineConfirmedDown reports a machine the health checker has positively seen
+// unhealthy. It is deliberately narrower than "the health cache says no": a
+// healthy machine whose entry has merely gone stale is not down.
+func machineConfirmedDown(machine *Machine) bool {
+	machine.mu.RLock()
+	defer machine.mu.RUnlock()
+	return !machine.IsHealthy
+}
+
+// healthCacheStatus reports whether the machine's health entry is fresh enough
+// to act on, and why not when it is not. Note that "not cached" covers both an
+// unhealthy machine and a healthy machine whose entry has simply gone stale.
 func (p *ProxyService) healthCacheStatus(machine *Machine) (cached bool, reason string) {
 	machine.mu.RLock()
 	defer machine.mu.RUnlock()
@@ -1730,6 +1899,8 @@ func (p *ProxyService) wakeAndWait(ctx context.Context, machine *Machine) error 
 	return p.waitForWake(ctx, machine)
 }
 
+// waitForWake sends magic packets on a ticker and polls health until the machine
+// answers or the wake timeout expires.
 func (p *ProxyService) waitForWake(ctx context.Context, machine *Machine) error {
 	timeout := p.clock.After(p.config.Timeout)
 	healthCheckTicker := p.clock.NewTicker(p.config.PollInterval)
@@ -1908,6 +2079,8 @@ func (p *ProxyService) forwardTCPConn(ctx context.Context, client net.Conn, rout
 	}
 }
 
+// proxyRequest forwards one request upstream and records the activity on the
+// machine, so an idle timeout is not counted while a client is being served.
 func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, route *Route) {
 	machineState := route.Machine
 	machineState.mu.Lock()
@@ -1979,7 +2152,11 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, rout
 		p.logger.Info("Response from %s: status=%d, content-length=%d",
 			route.Name, resp.StatusCode, resp.ContentLength)
 
-		if p.cache != nil && r.Method == http.MethodGet && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		// Only a 2xx GET on a configured path, from an anonymous request, to a
+		// response that is not marked private: anything else belongs to the one
+		// client that fetched it and must not be replayed to the next caller.
+		if p.cache != nil && r.Method == http.MethodGet && resp.StatusCode >= 200 && resp.StatusCode < 300 &&
+			!requestHasUserState(r) && !responseHasUserState(resp.Header) {
 			cachePaths, exists := p.config.CacheRoutes[route.Name]
 			if exists {
 				var shouldCache bool
@@ -1997,16 +2174,12 @@ func (p *ProxyService) proxyRequest(w http.ResponseWriter, r *http.Request, rout
 				}
 
 				if shouldCache {
-					buf := &bytes.Buffer{}
-					tee := io.TeeReader(resp.Body, buf)
 					resp.Body = &catchingBody{
-						Reader:   tee,
 						original: resp.Body,
-						onDone: func() {
-							body := buf.Bytes()
-							if int64(len(body)) <= p.config.CacheMaxResponseSize {
-								p.cache.Save(route.Name, r.URL.Path, resp.StatusCode, resp.Header, body)
-							}
+						buf:      &bytes.Buffer{},
+						limit:    p.config.CacheMaxResponseSize,
+						onDone: func(body []byte) {
+							p.cache.Save(route.Name, cacheKeyFor(r), resp.StatusCode, resp.Header, body)
 						},
 					}
 				}
@@ -2130,6 +2303,11 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 			if err != nil {
 				return nil, fmt.Errorf("invalid cache ttl: %w", err)
 			}
+			// A non-positive ttl expires every entry the moment it is written, so
+			// the cache never answers a single request while looking configured.
+			if cacheTTL <= 0 {
+				return nil, fmt.Errorf("cache ttl must be positive, got %v", cacheTTL)
+			}
 		}
 
 		cacheMaxResponseSize = 10 * 1024 * 1024
@@ -2142,6 +2320,13 @@ func LoadConfig(filename string, clock Clock) (*ProxyConfig, error) {
 			cacheWarmInterval, err = time.ParseDuration(config.CacheConfig.WarmInterval)
 			if err != nil {
 				return nil, fmt.Errorf("invalid cache warm_interval: %w", err)
+			}
+			// time.NewTicker panics on a non-positive interval, and it panics
+			// inside the warming goroutine, which takes the whole proxy down at
+			// startup. An operator writing "0s" to mean "don't warm" must get a
+			// configuration error instead.
+			if cacheWarmInterval <= 0 {
+				return nil, fmt.Errorf("cache warm_interval must be positive, got %v", cacheWarmInterval)
 			}
 		}
 
@@ -2540,10 +2725,13 @@ func (l *StdLogger) Error(msg string, args ...interface{}) {
 	log.Printf("[ERROR] "+msg, args...)
 }
 
+// Debug writes a debug-level line.
 func (l *StdLogger) Debug(msg string, args ...interface{}) {
 	log.Printf("[DEBUG] "+msg, args...)
 }
 
+// logStartup announces the running build, so a log identifies the version that
+// produced it.
 func logStartup(logger Logger, version string) {
 	logger.Info("Starting doormouse version `%s`", version)
 }
