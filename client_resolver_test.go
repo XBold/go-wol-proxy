@@ -231,6 +231,38 @@ func TestClientResolverUpdateAtCapacityDoesNotEvict(t *testing.T) {
 	}
 }
 
+// TestClientResolverRefreshedEntryLeavesTheFrontOfOrder checks that re-storing a
+// cached IP moves it to the back of the insertion order. Left at the front, a
+// freshly refreshed entry stops makeRoomLocked's expired sweep dead in its
+// tracks and then becomes the first entry evicted, so the one entry that had
+// just been resolved again was the one dropped.
+func TestClientResolverRefreshedEntryLeavesTheFrontOfOrder(t *testing.T) {
+	r := newClientResolver(true)
+	r.maxEntries = 3
+	r.ttl = time.Hour
+
+	r.store("192.0.2.1", "first.example")
+	r.store("192.0.2.2", "second.example")
+	r.store("192.0.2.3", "third.example")
+
+	// 192.0.2.1 is the oldest entry, and it is the one refreshed.
+	r.store("192.0.2.1", "renewed.example")
+	r.store("192.0.2.4", "new.example")
+
+	if got := r.cacheSize(); got != 3 {
+		t.Fatalf("cache size = %d, want the cap of 3", got)
+	}
+	if !r.hasKey("192.0.2.1") {
+		t.Fatal("the entry that had just been refreshed must not be the one evicted")
+	}
+	if r.hasKey("192.0.2.2") {
+		t.Fatal("192.0.2.2 is now the least recently resolved entry and should have been evicted")
+	}
+	if got := r.hostnameFor("192.0.2.1"); got != "renewed.example" {
+		t.Fatalf("hostname = %q, want renewed.example", got)
+	}
+}
+
 // TestClientResolverDefaultCapIs8192 pins the production cap so a test-only
 // override cannot quietly become the shipped value.
 func TestClientResolverDefaultCapIs8192(t *testing.T) {

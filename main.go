@@ -1023,13 +1023,19 @@ func (r *clientResolver) lookupOnce(ip string) (string, error) {
 		host = strings.TrimSuffix(host, ".") // drop FQDN trailing dot
 	}
 	call.host, call.err = host, err
-	call.wg.Done()
+
+	// Publish the result before releasing anything: the cache entry exists
+	// before the in-flight marker disappears and before the waiters wake. In
+	// the other order a request arriving between the two steps found neither a
+	// cached result nor an in-flight lookup to join, and started a second DNS
+	// lookup for the same IP.
+	r.store(ip, host)
 
 	r.mu.Lock()
 	delete(r.inFlight, ip)
 	r.mu.Unlock()
 
-	r.store(ip, host)
+	call.wg.Done()
 	return host, err
 }
 
@@ -1073,11 +1079,29 @@ func (r *clientResolver) store(ip, host string) {
 	now := time.Now()
 	if _, exists := r.cache[ip]; exists {
 		r.cache[ip] = clientHostEntry{hostname: host, resolvedAt: now}
+		// A refreshed entry has to leave its old slot in the insertion order:
+		// it is now the most recently resolved key. Left at the front it stops
+		// makeRoomLocked's expired-entry sweep in its tracks, and then becomes
+		// the first entry evicted - dropping the entry that had just been
+		// resolved again.
+		r.touchOrderLocked(ip)
 		return
 	}
 
 	r.makeRoomLocked(now)
 	r.cache[ip] = clientHostEntry{hostname: host, resolvedAt: now}
+	r.order = append(r.order, ip)
+}
+
+// touchOrderLocked moves an already-cached key to the back of the insertion
+// order, making it the most recently resolved entry. Caller holds r.mu.
+func (r *clientResolver) touchOrderLocked(ip string) {
+	for i, k := range r.order {
+		if k == ip {
+			r.order = append(r.order[:i], r.order[i+1:]...)
+			break
+		}
+	}
 	r.order = append(r.order, ip)
 }
 
