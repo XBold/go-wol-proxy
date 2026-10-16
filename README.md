@@ -275,11 +275,13 @@ for routes named in `[[cache.routes]]`; responses larger than
 of an entry, so `/models?filter=a` is stored and replayed separately from
 `/models`.
 
-Nothing that belongs to one client is ever stored: a request carrying an
-`Authorization` or `Cookie` header is not cached, and neither is a response that
-sets a `Set-Cookie` or declares `Cache-Control: private`, `no-store` or
-`no-cache`. A `Set-Cookie` header is also dropped from anything that does get
-stored, so a cached page cannot hand one visitor's session to the next.
+Nothing that belongs to one client is ever stored, and nothing stored
+anonymously is ever handed to an authenticated one: a request carrying an
+`Authorization` or `Cookie` header is not cached and is not answered from cache
+either, and neither is a response that sets a `Set-Cookie` or declares
+`Cache-Control: private`, `no-store` or `no-cache`. A `Set-Cookie` header is
+also dropped from anything that does get stored, so a cached page cannot hand
+one visitor's session to the next.
 
 The cache answers only for a machine the health checker has confirmed down. A
 machine that is up but whose health entry has gone stale still serves its own

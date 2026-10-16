@@ -426,3 +426,102 @@ func TestWriteFileAtomicConcurrentWriters(t *testing.T) {
 		t.Errorf("temp files left behind: %v", leftovers)
 	}
 }
+
+// TestWarmMachineSkipsUnshareableResponse: the warm-up client sends no
+// credentials, but the backend can still answer with a cookie or a
+// Cache-Control that says the body is not shareable. Save strips Set-Cookie and
+// keeps the body, so the guard has to be in the warm-up path too - otherwise a
+// later offline GET is handed a response the upstream never meant to give it.
+func TestWarmMachineSkipsUnshareableResponse(t *testing.T) {
+	for _, tc := range []struct{ name, header, value string }{
+		{"Set-Cookie", "Set-Cookie", "session=abc123; Path=/"},
+		{"Cache-Control private", "Cache-Control", "private"},
+		{"Cache-Control no-store", "Cache-Control", "no-store"},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/health" {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				w.Header().Set(tc.header, tc.value)
+				io.WriteString(w, `{"data":[{"id":"model-a"}]}`)
+			}))
+			defer backend.Close()
+
+			p, cs, _, _, _, machine := setupCacheProxy(t, backend, t.TempDir(), []string{"/models"})
+			p.warmMachine(machine)
+
+			if _, ok := cs.Get("backend.test", "/models"); ok {
+				t.Fatalf("a warmed %s response must not be cached", tc.name)
+			}
+		})
+	}
+}
+
+// TestCacheNotServedForCredentialedRequest: every stored entry was fetched
+// anonymously, so replaying it to a logged-in client answers that client with a
+// response the backend never produced for it.
+func TestCacheNotServedForCredentialedRequest(t *testing.T) {
+	backend := newCacheTestBackend(t, false)
+	p, cs, wol, hc, _, machine := setupCacheProxy(t, backend, t.TempDir(), []string{"/models"})
+
+	req := httptest.NewRequest("GET", "http://backend.test:9100/models", nil)
+	rec := httptest.NewRecorder()
+	p.handleRequest(rec, req)
+	waitFor(t, 3*time.Second, "cache entry after an anonymous GET", func() bool {
+		_, ok := cs.Get("backend.test", "/models")
+		return ok
+	})
+
+	hc.setResult(false)
+	setMachineHealth(machine, false)
+	p.config.Timeout = 1 * time.Second
+
+	req2 := httptest.NewRequest("GET", "http://backend.test:9100/models", nil)
+	req2.Header.Set("Cookie", "session=abc123")
+	rec2 := httptest.NewRecorder()
+	p.handleRequest(rec2, req2)
+
+	if rec2.Code == http.StatusOK {
+		t.Fatal("a credentialed request must not be answered with the anonymous cached response")
+	}
+	if rec2.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 while the machine is down", rec2.Code)
+	}
+	if wol.callCount() == 0 {
+		t.Error("a credentialed cache miss must still attempt a wake")
+	}
+}
+
+// TestCacheSaveRenewsTimestampForUnchangedContent: warm-up re-fetches a body
+// that never changes, and Save skips the write when the bytes match. That left
+// the Timestamp inside the envelope at the original save time, so an entry that
+// was being refreshed every cycle still expired and stopped being served.
+func TestCacheSaveRenewsTimestampForUnchangedContent(t *testing.T) {
+	const ttl = time.Second
+	cs := NewCacheStore(filepath.Join(t.TempDir(), "cache"), ttl, 1<<20,
+		map[string][]string{"backend.test": {"/models"}}, noopLogger{})
+	defer cs.Close()
+
+	headers := http.Header{"Content-Type": []string{"application/json"}}
+	body := []byte(`{"data":[{"id":"model-a"}]}`)
+
+	cs.Save("backend.test", "/models", http.StatusOK, headers, body)
+	if _, ok := cs.Get("backend.test", "/models"); !ok {
+		t.Fatal("a freshly saved entry must be readable")
+	}
+
+	// Past half the TTL: the next identical save has to renew the envelope
+	// instead of skipping the write.
+	time.Sleep(700 * time.Millisecond)
+	cs.Save("backend.test", "/models", http.StatusOK, headers, body)
+
+	// From here the original save time has aged out of the TTL, so only a
+	// renewed envelope is still servable.
+	time.Sleep(500 * time.Millisecond)
+	if _, ok := cs.Get("backend.test", "/models"); !ok {
+		t.Fatal("an entry warm-up keeps refreshing must stay inside its TTL")
+	}
+}

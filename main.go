@@ -425,7 +425,8 @@ func (cs *CacheStore) load(routeName, urlPath string) (*cacheEntry, bool) {
 
 // Save stores one response for a route+path pair, skipping the write when the
 // body is byte-identical to what is already on disk and rejecting bodies over
-// the configured size.
+// the configured size. An unchanged entry still gets its envelope rewritten
+// once it is past half its TTL, so refreshing it keeps it alive.
 func (cs *CacheStore) Save(routeName, urlPath string, statusCode int, headers http.Header, body []byte) {
 	urlPath = path.Clean(urlPath)
 	if urlPath == "." || urlPath == "" {
@@ -449,10 +450,19 @@ func (cs *CacheStore) Save(routeName, urlPath string, statusCode int, headers ht
 		// write in that case would leave the cache empty forever for
 		// unchanged responses (e.g. a static model list), sending WOL on
 		// every offline request.
-		if _, err := os.Stat(cacheFile); err == nil {
-			cs.entriesMu.Unlock()
-			cs.logger.Debug("Cache unchanged for %s %s, skipping write", routeName, urlPath)
-			return
+		if info, err := os.Stat(cacheFile); err == nil {
+			// What expires an entry is the Timestamp inside the envelope, and
+			// skipping the write leaves it at the original save time. A response
+			// that never changes would therefore go stale and stop being served
+			// even though warm-up keeps re-fetching it byte for byte. Refresh the
+			// envelope once the entry is past half its lifetime instead: that
+			// bounds the extra writes to roughly one per ttl/2 per entry rather
+			// than one per warm cycle.
+			if time.Since(info.ModTime()) < cs.ttl/2 {
+				cs.entriesMu.Unlock()
+				cs.logger.Debug("Cache unchanged for %s %s, skipping write", routeName, urlPath)
+				return
+			}
 		}
 	}
 	cs.entriesMu.Unlock()
@@ -1442,6 +1452,17 @@ func (p *ProxyService) warmMachine(machine *Machine) {
 						machine.Name, cacheKey, p.config.CacheMaxResponseSize)
 					continue
 				}
+				// The warm-up client sends no credentials, but the backend can
+				// still answer with something that belongs to somebody: a cookie
+				// or a Cache-Control that says the body is not shareable. Save
+				// strips Set-Cookie but keeps the body, so the guard has to happen
+				// here - otherwise a later offline GET is handed a response the
+				// upstream never meant to give it.
+				if responseHasUserState(resp.Header) {
+					p.logger.Debug("Skipping cache for %s %s: response is not shareable",
+						machine.Name, cacheKey)
+					continue
+				}
 				p.cache.Save(route.Name, cacheKey, resp.StatusCode, resp.Header, body)
 			} else {
 				resp.Body.Close()
@@ -1706,7 +1727,13 @@ func (p *ProxyService) handleRequest(w http.ResponseWriter, r *http.Request) {
 	// Only a machine confirmed unhealthy may be answered from cache. The
 	// health cache going stale is not evidence the machine is down, and a live
 	// machine must serve its own response rather than a stored one.
-	if p.cache != nil && r.Method == http.MethodGet && machineConfirmedDown(machineState) {
+	//
+	// A request that carries credentials is not answered from cache either:
+	// every stored entry is one that was fetched anonymously, so replaying it
+	// to a logged-in client would give that client a response the backend
+	// never produced for it.
+	if p.cache != nil && r.Method == http.MethodGet &&
+		machineConfirmedDown(machineState) && !requestHasUserState(r) {
 		if resp, ok := p.cache.Get(route.Name, cacheKeyFor(r)); ok {
 			p.logger.Info("Serving cached response for %s %s (machine %s is down)",
 				r.Method, r.URL.RequestURI(), machineName)
