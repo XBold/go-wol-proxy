@@ -962,6 +962,7 @@ type clientLookup struct {
 // maxClientHostCacheEntries is the default hard cap on the number of distinct
 // client IPs the resolver remembers. It is a ceiling, not a target.
 const maxClientHostCacheEntries = 8192
+const maxClientHostLookups = 64
 
 // newClientResolver returns a resolver honouring the configured setting; with
 // enabled false it never looks anything up.
@@ -1006,10 +1007,18 @@ func (r *clientResolver) resolve(ip string) (string, bool) {
 // its result, so the others find it cached instead of repeating it.
 func (r *clientResolver) lookupOnce(ip string) (string, error) {
 	r.mu.Lock()
+	if entry, ok := r.cache[ip]; ok && !r.entryExpired(entry, time.Now()) {
+		r.mu.Unlock()
+		return entry.hostname, nil
+	}
 	if call, ok := r.inFlight[ip]; ok {
 		r.mu.Unlock()
 		call.wg.Wait()
 		return call.host, call.err
+	}
+	if len(r.inFlight) >= maxClientHostLookups {
+		r.mu.Unlock()
+		return "", nil
 	}
 	call := &clientLookup{}
 	call.wg.Add(1)
@@ -1079,11 +1088,6 @@ func (r *clientResolver) store(ip, host string) {
 	now := time.Now()
 	if _, exists := r.cache[ip]; exists {
 		r.cache[ip] = clientHostEntry{hostname: host, resolvedAt: now}
-		// A refreshed entry has to leave its old slot in the insertion order:
-		// it is now the most recently resolved key. Left at the front it stops
-		// makeRoomLocked's expired-entry sweep in its tracks, and then becomes
-		// the first entry evicted - dropping the entry that had just been
-		// resolved again.
 		r.touchOrderLocked(ip)
 		return
 	}
@@ -1105,26 +1109,21 @@ func (r *clientResolver) touchOrderLocked(ip string) {
 	r.order = append(r.order, ip)
 }
 
-// makeRoomLocked frees room for one new key once the cache sits at its hard
-// cap. It first reaps expired entries from the oldest end of the insertion
-// order, and only if that leaves the cache still full does it evict the oldest
-// entry outright — so a cache of fresh entries stays at the cap instead of
-// growing, and a fresh entry is never dropped while an expired one is available.
-// Each key leaves the order at most once, so this is amortised constant work
-// per insertion rather than a scan of the whole cache under the write lock.
 func (r *clientResolver) makeRoomLocked(now time.Time) {
 	if len(r.cache) < r.maxEntries {
 		return
 	}
-	for len(r.order) > 0 {
-		oldest := r.order[0]
-		entry, ok := r.cache[oldest]
-		if !ok || !r.entryExpired(entry, now) {
-			break
+	retained := r.order[:0]
+	for _, key := range r.order {
+		entry, ok := r.cache[key]
+		if !ok || r.entryExpired(entry, now) {
+			delete(r.cache, key)
+			continue
 		}
-		r.order = r.order[1:]
-		delete(r.cache, oldest)
+		retained = append(retained, key)
 	}
+	clear(r.order[len(retained):])
+	r.order = retained
 	for len(r.cache) >= r.maxEntries && len(r.order) > 0 {
 		oldest := r.order[0]
 		r.order = r.order[1:]
