@@ -214,18 +214,18 @@ the config.
 
 ### Names on the near side
 
-By default doormouse logs the client's IP only. Set `client_hostname_lookup =
-true` to have it do a reverse-DNS (PTR) lookup for each client IP and log the
-hostname alongside the address, so the request log shows which machine or
-service sent the traffic.
+By default doormouse logs only the client's IP. Set `client_hostname_lookup =
+true` to also log the client's hostname. doormouse gets it with a reverse-DNS
+(PTR) lookup, so the request log shows which machine or service sent the
+traffic.
 
-The lookup is best-effort and cached (results for 30 minutes, failures for 2),
-and concurrent requests from one uncached IP share a single lookup. It is not
-asynchronous though: on a cache miss doormouse waits for the lookup — up to one
-second — before it writes the incoming-request log line and forwards the
-request. That is why it is opt-in, and why you should turn it off when the
-network has no PTR records or DNS lookups are slow.
+Lookups are best-effort and cached: hits for 30 minutes, failures for 2.
+Concurrent requests from the same uncached IP share one lookup.
 
+> [!WARNING]
+> The lookup is synchronous. On a cache miss, doormouse waits up to one second
+> for it before it logs the request and forwards it. That is why the setting is
+> opt-in. Leave it off if your network has no PTR records or slow DNS.
 ## Liveness and readiness
 
 There are two `health_check` fields and they answer different questions.
